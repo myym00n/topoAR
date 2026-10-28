@@ -1,0 +1,48 @@
+name: Сборка APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Сборка
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Переименовать APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk TopoAR.apk
+
+      - name: Сохранить APK в артефактах
+        uses: actions/upload-artifact@v4
+        with:
+          name: TopoAR-apk
+          path: TopoAR.apk
+
+      - name: Выложить в релиз «latest» (прямая ссылка для телефона)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: ТопоAR — последняя сборка
+          body: Сборка ${{ github.sha }}. Скачайте TopoAR.apk на телефон и установите.
+          prerelease: false
+          make_latest: true
+          files: TopoAR.apk
