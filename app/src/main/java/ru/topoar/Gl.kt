@@ -235,6 +235,7 @@ class PlanRenderer {
     private var uMvp = 0
     private var uTex = 0
     private var uAlpha = 0
+    private var uPaper = 0
     private var vbo = 0
     private var ibo = 0
     private var tex = 0
@@ -253,13 +254,18 @@ class PlanRenderer {
             precision mediump float;
             uniform sampler2D uTex;
             uniform float uAlpha;
+            uniform vec4 uPaper;      // предумноженный цвет «бумаги» под линиями (a = 0 — без бумаги)
             in vec2 vUv;
             out vec4 oColor;
-            void main() { oColor = texture(uTex, vUv) * uAlpha; }
+            void main() {
+                vec4 t = texture(uTex, vUv) * uAlpha;
+                oColor = t + uPaper * (1.0 - t.a);
+            }
             """.trimIndent())
         uMvp = GLES30.glGetUniformLocation(prog, "uMvp")
         uTex = GLES30.glGetUniformLocation(prog, "uTex")
         uAlpha = GLES30.glGetUniformLocation(prog, "uAlpha")
+        uPaper = GLES30.glGetUniformLocation(prog, "uPaper")
     }
 
     fun upload(plan: PlanMesh, bmp: Bitmap) {
@@ -280,11 +286,14 @@ class PlanRenderer {
         Gl.check("PlanRenderer.upload")
     }
 
-    fun draw(mvp: FloatArray, alpha: Float) {
+    /** [paperAlpha] > 0 — подложить под план светлую «землю» (для просмотра без камеры). */
+    fun draw(mvp: FloatArray, alpha: Float, paperAlpha: Float = 0f) {
         if (count == 0) return
         GLES30.glUseProgram(prog)
         GLES30.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
         GLES30.glUniform1f(uAlpha, alpha)
+        val pa = paperAlpha
+        GLES30.glUniform4f(uPaper, 0.93f * pa, 0.92f * pa, 0.87f * pa, pa)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex)
         GLES30.glUniform1i(uTex, 0)
@@ -381,6 +390,13 @@ class Shapes {
     fun drawReticle(sh: MeshShader, poseMatrix: FloatArray, viewProj: FloatArray) {
         drawShape(sh, ring, poseMatrix, viewProj, floatArrayOf(1f, 0.48f, 0.2f, 1f))
         drawShape(sh, disc, poseMatrix, viewProj, floatArrayOf(1f, 1f, 1f, 1f))
+    }
+
+    fun drawReticleAt(sh: MeshShader, x: Float, y: Float, z: Float, viewProj: FloatArray, ok: Boolean) {
+        Matrix.setIdentityM(tmpModel, 0)
+        Matrix.translateM(tmpModel, 0, x, y + 0.01f, z)
+        drawShape(sh, ring, tmpModel, viewProj, if (ok) floatArrayOf(1f, 0.48f, 0.2f, 1f) else floatArrayOf(1f, 1f, 1f, 0.8f))
+        drawShape(sh, disc, tmpModel, viewProj, floatArrayOf(1f, 1f, 1f, 1f))
     }
 
     fun drawPin(sh: MeshShader, x: Float, y: Float, z: Float, scale: Float, viewProj: FloatArray, color: FloatArray) {

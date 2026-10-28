@@ -1,6 +1,7 @@
 package ru.topoar
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
@@ -17,6 +18,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -24,6 +26,7 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.google.ar.core.ArCoreApk
@@ -36,31 +39,48 @@ import kotlin.math.hypot
 import kotlin.math.max
 
 class MainActivity : Activity(), MapView.Listener {
+
+    /** Шаги привязки на местности. */
+    private enum class Step { STAND, SIGHT, DONE, REFINE }
+
     private lateinit var glView: GLSurfaceView
     private lateinit var renderer: ArRenderer
-    private lateinit var status: TextView
-    private lateinit var mapBox: FrameLayout
-    private lateinit var map: MapView
     private lateinit var compass: Compass
     private val ui = Handler(Looper.getMainLooper())
 
+    // экраны и панели
+    private lateinit var startScreen: View
+    private lateinit var startPkg: TextView
+    private lateinit var topBar: LinearLayout
+    private lateinit var title: TextView
+    private lateinit var status: TextView
+    private lateinit var mapBox: FrameLayout
+    private lateinit var map: MapView
+    private lateinit var crosshair: View
+    private lateinit var bottom: LinearLayout
+    private lateinit var stepText: TextView
+    private lateinit var primary: Button
+    private lateinit var actions: LinearLayout
+    private lateinit var adjustRow: LinearLayout
+
     private var session: Session? = null
     private var installRequested = false
+    private var pendingMode: Mode? = null
 
-    private val fieldAl = Aligner()          // привязка на местности
-    private val table = Aligner()          // «макет на столе»
-    private var tableMode = false
-    private var tableRot = 0.0
+    private val fieldAl = Aligner()
+    private val tableAl = Aligner()
+    private var step = Step.STAND
     private var pkg: TopoPackage? = null
     private var selected: ControlPoint? = null
-    private var hint = ""
+    private var customPoint: FloatArray? = null       // точка «я тут», выбранная долгим нажатием
+    private var target: ControlPoint? = null          // точка для визира
+    private var bigMap = true
 
-    private lateinit var bMap: Button
-    private lateinit var bAdjust: Button
-    private lateinit var bUnder: Button
-    private lateinit var bTable: Button
-    private lateinit var bTake: Button
-    private lateinit var adjustRow: LinearLayout
+    private var tablePlaced = false
+    private var tableAt = FloatArray(3)
+    private var tableScale = 1.0
+    private var tableRot = 0.0
+    private var tableBaseScale = 1.0
 
     private val cacheFile by lazy { File(filesDir, "current.topoar") }
 
@@ -71,10 +91,10 @@ class MainActivity : Activity(), MapView.Listener {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         compass = Compass(this)
         renderer = ArRenderer { msg -> ui.post { toast(msg) } }
-        renderer.aligner = fieldAl
         buildUi()
         handleIntent(intent)
         if (pkg == null && cacheFile.exists()) loadPackage(cacheFile, "последний пакет")
+        showStart()
         ui.post(tick)
     }
 
@@ -85,49 +105,20 @@ class MainActivity : Activity(), MapView.Listener {
 
     override fun onResume() {
         super.onResume()
-        if (session == null) {
-            try {
-                when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
-                    ArCoreApk.InstallStatus.INSTALL_REQUESTED -> { installRequested = true; return }
-                    else -> {}
-                }
-                if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-                    requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
-                    return
-                }
-                val s = Session(this)
-                val c = Config(s)
-                c.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-                c.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-                c.focusMode = Config.FocusMode.AUTO
-                if (s.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) c.depthMode = Config.DepthMode.AUTOMATIC
-                s.configure(c)
-                session = s
-            } catch (e: Exception) {
-                status.text = "AR недоступен: ${e.javaClass.simpleName}\n${e.message ?: ""}\n" +
-                    "Нужен телефон с поддержкой ARCore («Сервисы Google Play для AR»)."
-                return
-            }
-        }
-        try {
-            session?.resume()
-        } catch (e: Exception) {
-            status.text = "Камера недоступна: ${e.message}"
-            session = null
-            return
-        }
         @Suppress("DEPRECATION")
         renderer.displayRotation = windowManager.defaultDisplay.rotation
-        renderer.session = session
+        val pm = pendingMode
+        if (pm != null) { pendingMode = null; enterMode(pm) }
+        else if (renderer.mode == Mode.TABLE || renderer.mode == Mode.FIELD) {
+            if (!startAr()) enterMode(Mode.START)
+        }
         glView.onResume()
-        compass.start()
     }
 
     override fun onPause() {
         super.onPause()
-        compass.stop()
+        stopAr()
         glView.onPause()
-        session?.pause()
     }
 
     override fun onDestroy() {
@@ -137,52 +128,269 @@ class MainActivity : Activity(), MapView.Listener {
         session = null
     }
 
+    @Deprecated("Activity API")
+    override fun onBackPressed() {
+        if (renderer.mode != Mode.START) enterMode(Mode.START)
+        else {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
+    }
+
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (grantResults.isEmpty() || grantResults[0] != PackageManager.PERMISSION_GRANTED) {
-            status.text = "Без камеры AR не работает. Разрешите доступ к камере в настройках."
+        if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            // режим включится в onResume через pendingMode
+        } else {
+            pendingMode = null
+            toast("Без доступа к камере AR не работает. 3D-просмотр доступен.")
         }
+    }
+
+    // ─────────────────────────── ARCore ───────────────────────────
+
+    /** Создаёт/возобновляет сессию ARCore. false — нужно подождать (установка, разрешение) или AR недоступен. */
+    private fun startAr(): Boolean {
+        try {
+            if (session == null) {
+                if (ArCoreApk.getInstance().requestInstall(this, !installRequested) == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
+                    installRequested = true
+                    return false
+                }
+                if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
+                    return false
+                }
+                val s = Session(this)
+                val c = Config(s)
+                c.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
+                c.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
+                c.focusMode = Config.FocusMode.AUTO
+                if (s.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) c.depthMode = Config.DepthMode.AUTOMATIC
+                s.configure(c)
+                session = s
+            }
+            session!!.resume()
+        } catch (e: Exception) {
+            pendingMode = null
+            AlertDialog.Builder(this).setTitle("AR недоступен")
+                .setMessage("${e.javaClass.simpleName}: ${e.message ?: ""}\n\nНужен телефон с поддержкой ARCore и «Сервисы Google Play для AR». 3D-просмотр работает и без этого.")
+                .setPositiveButton("OK", null).show()
+            return false
+        }
+        synchronized(renderer.lock) {
+            renderer.session = session
+            renderer.resetAr()
+        }
+        compass.start()
+        return true
+    }
+
+    private fun stopAr() {
+        synchronized(renderer.lock) { renderer.session = null }
+        session?.pause()
+        compass.stop()
+    }
+
+    // ─────────────────────────── режимы ───────────────────────────
+
+    private fun enterMode(m: Mode) {
+        if ((m == Mode.TABLE || m == Mode.FIELD || m == Mode.VIEWER) && pkg == null) {
+            toast("Сначала откройте пакет .topoar"); return
+        }
+        if (m == Mode.TABLE || m == Mode.FIELD) {
+            pendingMode = m
+            if (!startAr()) return              // вернёмся в onResume после установки/разрешения
+            pendingMode = null
+        } else stopAr()
+
+        renderer.mode = m
+        renderer.underground = false
+        renderer.selectedPoint = null
+        when (m) {
+            Mode.START -> showStart()
+            Mode.VIEWER -> showViewer()
+            Mode.TABLE -> showTable()
+            Mode.FIELD -> showField()
+        }
+    }
+
+    private fun showStart() {
+        renderer.mode = Mode.START
+        startScreen.visibility = View.VISIBLE
+        topBar.visibility = View.GONE
+        bottom.visibility = View.GONE
+        mapBox.visibility = View.GONE
+        crosshair.visibility = View.GONE
+        updateStartPkg()
+    }
+
+    private fun showChrome(t: String) {
+        startScreen.visibility = View.GONE
+        topBar.visibility = View.VISIBLE
+        bottom.visibility = View.VISIBLE
+        title.text = t
+        adjustRow.visibility = View.GONE
+        map.adjustMode = false
+    }
+
+    private fun showViewer() {
+        showChrome("3D-просмотр")
+        mapBox.visibility = View.GONE
+        crosshair.visibility = View.GONE
+        renderer.showReticle = false
+        stepText.text = "Один палец — вращать. Два пальца — приблизить и сдвинуть."
+        primary.visibility = View.GONE
+        setActions(
+            act("Подземка") { toggleUnder(it) },
+            act("Слои") { layersDialog() },
+            act("Сверху") { renderer.orbit.pitch = 1.45f; renderer.orbit.yaw = 0f },
+            act("Сбросить вид") { pkg?.let { renderer.resetOrbit(it) } },
+        )
+    }
+
+    private fun showTable() {
+        showChrome("Макет на столе")
+        renderer.aligner = tableAl
+        tableAl.reset()
+        tablePlaced = false
+        tableRot = 0.0
+        mapBox.visibility = View.GONE
+        crosshair.visibility = View.GONE
+        renderer.showReticle = true
+        primary.visibility = View.VISIBLE
+        primary.text = "Поставить сюда"
+        primary.setOnClickListener { placeTableAtAim() }
+        setActions(
+            act("Подземка") { toggleUnder(it) },
+            act("Слои") { layersDialog() },
+            act("Крупнее") { tableScale *= 1.5; applyTable() },
+            act("Мельче") { tableScale /= 1.5; applyTable() },
+        )
+    }
+
+    private fun showField() {
+        showChrome("На местности")
+        renderer.aligner = fieldAl
+        map.pkg = pkg
+        mapBox.visibility = View.VISIBLE
+        renderer.showReticle = false
+        primary.visibility = View.VISIBLE
+        setStep(if (fieldAl.aligned) Step.DONE else Step.STAND)
+    }
+
+    private fun setStep(s: Step) {
+        step = s
+        selected = null; customPoint = null; target = null
+        map.selected = null
+        renderer.selectedPoint = null
+        crosshair.visibility = if (s == Step.SIGHT) View.VISIBLE else View.GONE
+        when (s) {
+            Step.STAND, Step.REFINE -> {
+                setMapBig(true)
+                stepText.text = (if (s == Step.STAND) "Шаг 1 из 2 · Где вы стоите?\n" else "Уточнение · Встаньте на другую точку\n") +
+                    "Встаньте точно на заметную точку (угол здания, люк, столб) и нажмите её на карте.\n" +
+                    "Нужной точки нет — долгое нажатие на карте отметит любое место."
+                primary.text = "Я стою здесь"
+                primary.setOnClickListener { standHere() }
+                setActions(
+                    act("К моему месту") { centerMapOnMe() },
+                    act(if (s == Step.STAND) "Назад" else "Отмена") { if (s == Step.STAND) enterMode(Mode.START) else setStep(Step.DONE) },
+                )
+            }
+            Step.SIGHT -> {
+                setMapBig(false)
+                stepText.text = "Шаг 2 из 2 · Куда смотрите?\n" +
+                    "Нажмите на карте другую точку, которую видно отсюда (лучше 20–100 м). " +
+                    "Наведите на неё крестик в центре экрана и нажмите «Навёл»."
+                primary.text = "Навёл"
+                primary.setOnClickListener { sightNow() }
+                setActions(
+                    act("Пропустить (2-я точка)") { setStep(Step.REFINE) },
+                    act("Заново") { fieldAl.reset(); setStep(Step.STAND) },
+                )
+            }
+            Step.DONE -> {
+                setMapBig(false)
+                stepText.text = "Готово — план на месте. Подвинуть вручную: «Подвинуть» и тащите карту."
+                primary.text = "Подземка"
+                primary.setOnClickListener { toggleUnder(primary) }
+                setActions(
+                    act("Слои") { layersDialog() },
+                    act("Карта ↕") { setMapBig(!bigMap) },
+                    act("Подвинуть") { toggleAdjust(it) },
+                    act("Уточнить") { setStep(Step.REFINE) },
+                    act("Заново") { fieldAl.reset(); setStep(Step.STAND) },
+                    act("Инфо") { infoDialog() },
+                )
+            }
+        }
+        updatePrimary()
+    }
+
+    private fun setMapBig(big: Boolean) {
+        bigMap = big
+        val dm = resources.displayMetrics
+        val lp = mapBox.layoutParams as LinearLayout.LayoutParams
+        if (big) {
+            lp.width = ViewGroup.LayoutParams.MATCH_PARENT
+            lp.height = (dm.heightPixels * 0.48).toInt()
+            lp.gravity = Gravity.NO_GRAVITY
+        } else {
+            lp.width = (dm.widthPixels * 0.46).toInt()
+            lp.height = (dm.widthPixels * 0.46).toInt()
+            lp.gravity = Gravity.END
+        }
+        mapBox.layoutParams = lp
     }
 
     // ─────────────────────────── интерфейс ───────────────────────────
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    private fun btn(text: String, accent: Boolean = false, onClick: (Button) -> Unit): Button {
+    private fun rounded(color: Int, stroke: Int = Color.argb(70, 255, 255, 255), r: Int = 12) = GradientDrawable().apply {
+        cornerRadius = dp(r).toFloat()
+        setColor(color)
+        setStroke(dp(1), stroke)
+    }
+
+    private fun act(text: String, onClick: (Button) -> Unit): Button {
         val b = Button(this)
         b.text = text
         b.isAllCaps = false
-        b.textSize = 14f
-        b.setTextColor(if (accent) Color.rgb(26, 13, 4) else Color.WHITE)
-        b.background = GradientDrawable().apply {
-            cornerRadius = dp(10).toFloat()
-            setColor(if (accent) Color.rgb(255, 123, 51) else Color.argb(200, 24, 30, 26))
-            setStroke(dp(1), Color.argb(90, 255, 255, 255))
-        }
-        b.setPadding(dp(12), 0, dp(12), 0)
-        b.minHeight = dp(44)
-        b.minimumHeight = dp(44)
+        b.textSize = 15f
+        b.setTextColor(Color.WHITE)
+        b.background = rounded(Color.argb(215, 30, 36, 32))
+        b.setPadding(dp(14), 0, dp(14), 0)
+        b.minHeight = dp(46)
+        b.minimumHeight = dp(46)
         b.setOnClickListener { onClick(b) }
-        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44))
-        lp.setMargins(dp(3), dp(3), dp(3), dp(3))
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(46))
+        lp.setMargins(dp(4), dp(4), dp(4), dp(4))
         b.layoutParams = lp
         return b
     }
 
-    private fun row(vararg views: View): HorizontalScrollView {
-        val l = LinearLayout(this)
-        l.orientation = LinearLayout.HORIZONTAL
-        views.forEach { l.addView(it) }
-        val sv = HorizontalScrollView(this)
-        sv.isHorizontalScrollBarEnabled = false
-        sv.addView(l)
-        return sv
-    }
-
     private fun setActive(b: Button, on: Boolean) {
-        (b.background as? GradientDrawable)?.setStroke(dp(if (on) 3 else 1), if (on) Color.rgb(255, 179, 122) else Color.argb(90, 255, 255, 255))
+        b.background = if (on) rounded(Color.rgb(255, 123, 51), Color.rgb(255, 179, 122)) else rounded(Color.argb(215, 30, 36, 32))
+        b.setTextColor(if (on) Color.rgb(26, 13, 4) else Color.WHITE)
     }
 
+    private fun setActions(vararg bs: Button) {
+        actions.removeAllViews()
+        bs.forEach { actions.addView(it) }
+    }
+
+    private fun text(s: String, size: Float, bold: Boolean = false, color: Int = Color.WHITE): TextView {
+        val t = TextView(this)
+        t.text = s
+        t.textSize = size
+        t.setTextColor(color)
+        if (bold) t.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        return t
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
     private fun buildUi() {
         val root = FrameLayout(this)
 
@@ -192,178 +400,249 @@ class MainActivity : Activity(), MapView.Listener {
         glView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
         glView.setRenderer(renderer)
         glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+        glView.setOnTouchListener { _, e -> onGlTouch(e); true }
         root.addView(glView, FrameLayout.LayoutParams(-1, -1))
 
-        root.addView(Crosshair(this), FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER))
+        crosshair = Crosshair(this)
+        root.addView(crosshair, FrameLayout.LayoutParams(dp(64), dp(64), Gravity.CENTER))
 
-        // верх: статус + карта
-        val top = LinearLayout(this)
-        top.orientation = LinearLayout.VERTICAL
-        status = TextView(this)
-        status.setTextColor(Color.WHITE)
-        status.textSize = 13.5f
-        status.typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
-        status.setShadowLayer(3f, 0f, 1f, Color.BLACK)
-        status.setPadding(dp(14), dp(30), dp(14), dp(8))
-        status.setBackgroundColor(Color.argb(120, 0, 0, 0))
-        top.addView(status, LinearLayout.LayoutParams(-1, -2))
+        // верх: заголовок, статус, карта
+        topBar = LinearLayout(this)
+        topBar.orientation = LinearLayout.VERTICAL
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+        head.setPadding(dp(8), dp(28), dp(14), dp(2))
+        val back = act("‹ Меню") { enterMode(Mode.START) }
+        head.addView(back)
+        title = text("", 18f, bold = true)
+        title.setPadding(dp(10), 0, 0, 0)
+        head.addView(title)
+        topBar.addView(head)
+        status = text("", 14f)
+        status.setShadowLayer(4f, 0f, 1f, Color.BLACK)
+        status.setPadding(dp(16), dp(2), dp(16), dp(8))
+        topBar.addView(status)
+        topBar.setBackgroundColor(Color.argb(140, 0, 0, 0))
 
         mapBox = FrameLayout(this)
         map = MapView(this)
         map.listener = this
         mapBox.addView(map, FrameLayout.LayoutParams(-1, -1))
+        mapBox.background = rounded(Color.WHITE, Color.argb(160, 0, 0, 0), 6)
         adjustRow = LinearLayout(this)
-        adjustRow.orientation = LinearLayout.HORIZONTAL
-        adjustRow.addView(btn("⟲ 1°") { rotate(Math.toRadians(1.0)) })
-        adjustRow.addView(btn("⟳ 1°") { rotate(Math.toRadians(-1.0)) })
-        adjustRow.addView(btn("▲ 5 см") { fieldAl.lift(0.05) })
-        adjustRow.addView(btn("▼ 5 см") { fieldAl.lift(-0.05) })
+        adjustRow.orientation = LinearLayout.VERTICAL
+        adjustRow.addView(act("⟲ 1°") { rotate(Math.toRadians(1.0)) })
+        adjustRow.addView(act("⟳ 1°") { rotate(Math.toRadians(-1.0)) })
+        adjustRow.addView(act("▲ 5 см") { fieldAl.lift(0.05) })
+        adjustRow.addView(act("▼ 5 см") { fieldAl.lift(-0.05) })
         adjustRow.visibility = View.GONE
-        mapBox.addView(adjustRow, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
-        mapBox.visibility = View.GONE
-        val h = resources.displayMetrics.heightPixels
-        top.addView(mapBox, LinearLayout.LayoutParams(-1, (h * 0.42).toInt()))
-        root.addView(top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+        mapBox.addView(adjustRow, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
+        val mlp = LinearLayout.LayoutParams(-1, dp(300))
+        mlp.setMargins(dp(8), dp(6), dp(8), 0)
+        topBar.addView(mapBox, mlp)
+        root.addView(topBar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
 
-        // низ: кнопки
-        val bottom = LinearLayout(this)
+        // низ: текст шага, главная кнопка, действия
+        bottom = LinearLayout(this)
         bottom.orientation = LinearLayout.VERTICAL
-        bottom.setPadding(dp(4), dp(6), dp(4), dp(16))
-        bottom.setBackgroundColor(Color.argb(110, 0, 0, 0))
-
-        bMap = btn("Карта") { toggleMap() }
-        bTake = btn("Взять точку", accent = true) { takePoint() }
-        val bStand = btn("Стою на точке") { standOnSelected() }
-        val bSight = btn("Визир") { sight() }
-        val bUndo = btn("Отменить") { undo() }
-        val bReset = btn("Сброс") { confirmReset() }
-        bottom.addView(row(bMap, bTake, bStand, bSight, bUndo, bReset))
-
-        bAdjust = btn("Подвинуть") { toggleAdjust() }
-        bUnder = btn("Подземка") { toggleUnder() }
-        val bLayers = btn("Слои") { layersDialog() }
-        bTable = btn("Макет") { toggleTable() }
-        val bOpen = btn("Открыть") { pickFile() }
-        val bInfo = btn("Инфо") { infoDialog() }
-        bottom.addView(row(bAdjust, bUnder, bLayers, bTable, bOpen, bInfo))
+        bottom.setPadding(dp(12), dp(10), dp(12), dp(18))
+        bottom.setBackgroundColor(Color.argb(170, 0, 0, 0))
+        stepText = text("", 15f)
+        stepText.setPadding(dp(4), 0, dp(4), dp(8))
+        bottom.addView(stepText)
+        primary = Button(this)
+        primary.isAllCaps = false
+        primary.textSize = 18f
+        primary.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        primary.setTextColor(Color.rgb(26, 13, 4))
+        primary.background = rounded(Color.rgb(255, 123, 51), Color.rgb(255, 179, 122), 14)
+        bottom.addView(primary, LinearLayout.LayoutParams(-1, dp(58)))
+        actions = LinearLayout(this)
+        actions.orientation = LinearLayout.HORIZONTAL
+        val sv = HorizontalScrollView(this)
+        sv.isHorizontalScrollBarEnabled = false
+        sv.addView(actions)
+        val slp = LinearLayout.LayoutParams(-1, -2)
+        slp.setMargins(0, dp(6), 0, 0)
+        bottom.addView(sv, slp)
         root.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
+        startScreen = buildStart()
+        root.addView(startScreen, FrameLayout.LayoutParams(-1, -1))
         setContentView(root)
+    }
+
+    private fun buildStart(): View {
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(20), dp(44), dp(20), dp(24))
+        col.addView(text("ТопоAR", 30f, bold = true))
+        col.addView(text("Топоплан в 3D и на местности", 15f, color = Color.rgb(170, 182, 175)))
+
+        val pkgCard = LinearLayout(this)
+        pkgCard.orientation = LinearLayout.VERTICAL
+        pkgCard.background = rounded(Color.rgb(28, 34, 30))
+        pkgCard.setPadding(dp(16), dp(14), dp(16), dp(14))
+        startPkg = text("Пакет не открыт", 15f)
+        pkgCard.addView(startPkg)
+        val open = act("Открыть пакет .topoar") { pickFile() }
+        pkgCard.addView(open)
+        val plp = LinearLayout.LayoutParams(-1, -2)
+        plp.setMargins(0, dp(20), 0, dp(14))
+        col.addView(pkgCard, plp)
+
+        fun card(t: String, sub: String, m: Mode) {
+            val c = LinearLayout(this)
+            c.orientation = LinearLayout.VERTICAL
+            c.background = rounded(Color.rgb(40, 48, 43), Color.argb(90, 255, 179, 122), 16)
+            c.setPadding(dp(18), dp(16), dp(18), dp(16))
+            c.addView(text(t, 20f, bold = true, color = Color.rgb(255, 160, 100)))
+            c.addView(text(sub, 14.5f, color = Color.rgb(205, 214, 208)))
+            c.isClickable = true
+            c.setOnClickListener { enterMode(m) }
+            val lp = LinearLayout.LayoutParams(-1, -2)
+            lp.setMargins(0, dp(6), 0, dp(6))
+            col.addView(c, lp)
+        }
+        card("3D-просмотр", "Покрутить модель пальцами. Камера не нужна — удобно дома.", Mode.VIEWER)
+        card("Макет на столе", "Модель через камеру на столе или полу. Встаёт сама, крутится и масштабируется пальцами.", Mode.TABLE)
+        card("На местности", "План в реальном размере на участке. Привязка в 2 шага: встать на точку и навести на вторую.", Mode.FIELD)
+        col.addView(text("\nПакет .topoar готовится на компьютере из DWG/DXF (конвертер topo3d).", 13f, color = Color.rgb(140, 150, 144)))
+
+        val sv = ScrollView(this)
+        sv.setBackgroundColor(Color.rgb(17, 22, 19))
+        sv.addView(col)
+        return sv
+    }
+
+    private fun updateStartPkg() {
+        val p = pkg
+        startPkg.text = if (p == null) "Пакет не открыт. Скиньте на телефон файл .topoar и откройте его."
+        else "Открыт: ${p.name}\n${p.width.toInt()} × ${p.height.toInt()} м · слоёв ${p.layers.size} · опорных точек ${p.controlPoints.size}"
     }
 
     /** Крестик по центру экрана. */
     private class Crosshair(ctx: Context) : View(ctx) {
-        private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; strokeWidth = 4f }
-        private val sh = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(160, 0, 0, 0); strokeWidth = 8f }
+        private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; strokeWidth = 5f }
+        private val sh = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(170, 0, 0, 0); strokeWidth = 10f }
         override fun onDraw(c: Canvas) {
             val cx = width / 2f; val cy = height / 2f; val r = width / 2f
             for (pp in listOf(sh, p)) {
-                c.drawLine(cx - r, cy, cx - r * 0.25f, cy, pp); c.drawLine(cx + r * 0.25f, cy, cx + r, cy, pp)
-                c.drawLine(cx, cy - r, cx, cy - r * 0.25f, pp); c.drawLine(cx, cy + r * 0.25f, cx, cy + r, pp)
+                c.drawLine(cx - r, cy, cx - r * 0.2f, cy, pp); c.drawLine(cx + r * 0.2f, cy, cx + r, cy, pp)
+                c.drawLine(cx, cy - r, cx, cy - r * 0.2f, pp); c.drawLine(cx, cy + r * 0.2f, cx, cy + r, pp)
             }
         }
     }
 
-    // ─────────────────────────── статус и карта ───────────────────────────
+    // ─────────────────────────── жесты по 3D ───────────────────────────
 
-    private val tick = object : Runnable {
-        override fun run() {
-            updateStatus()
-            ui.postDelayed(this, 250)
-        }
+    private var lx = 0f; private var ly = 0f; private var ld = 0f
+    private var lmx = 0f; private var lmy = 0f
+
+    private fun baseline(e: MotionEvent) {
+        if (e.pointerCount >= 2) {
+            lmx = (e.getX(0) + e.getX(1)) / 2; lmy = (e.getY(0) + e.getY(1)) / 2
+            ld = hypot((e.getX(1) - e.getX(0)).toDouble(), (e.getY(1) - e.getY(0)).toDouble()).toFloat()
+        } else { lx = e.x; ly = e.y }
     }
 
-    private fun f2(v: Float) = String.format(Locale.US, "%.2f", v)
-
-    private fun updateStatus() {
-        val fs = renderer.frameState
-        val sb = StringBuilder()
-        val p = pkg
-        if (p == null) sb.append("Откройте пакет .topoar (кнопка «Открыть»)\n")
-        else sb.append(p.name).append('\n')
-        if (!fs.tracking) {
-            sb.append(fs.message)
-        } else if (tableMode) {
-            sb.append(if (fs.hit == null) "Наведите крестик на стол" else "Нажмите «Поставить» — макет встанет в крестик")
-        } else {
-            val n = fieldAl.count()
-            if (fieldAl.aligned) {
-                sb.append("Привязка ").append(fieldAl.source)
-                val res = fieldAl.residuals()
-                if (res.isNotEmpty()) {
-                    sb.append("\nневязки: ")
-                    res.forEachIndexed { i, r -> sb.append("т").append(i + 1).append(" ").append(f2(r[0])).append(" м  ") }
-                    val rms = fieldAl.rms()
-                    if (rms >= 0) sb.append("\nСКО ").append(String.format(Locale.US, "%.2f", rms)).append(" м")
+    private fun onGlTouch(e: MotionEvent) {
+        val m = renderer.mode
+        if (m != Mode.VIEWER && m != Mode.TABLE) return
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> baseline(e)
+            MotionEvent.ACTION_POINTER_UP -> {
+                // остаётся один палец — новая опора по нему
+                val keep = if (e.actionIndex == 0) 1 else 0
+                lx = e.getX(keep); ly = e.getY(keep)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (e.pointerCount >= 2) {
+                    val mx = (e.getX(0) + e.getX(1)) / 2; val my = (e.getY(0) + e.getY(1)) / 2
+                    val d = hypot((e.getX(1) - e.getX(0)).toDouble(), (e.getY(1) - e.getY(0)).toDouble()).toFloat()
+                    val scale = if (ld > 10f) d / ld else 1f
+                    twoFingers(scale, mx - lmx, my - lmy)
+                    lmx = mx; lmy = my; ld = d
+                } else {
+                    oneFinger(e.x - lx, e.y - ly)
+                    lx = e.x; ly = e.y
                 }
-                if (n == 1) sb.append("\nУточните: «Визир» на дальнюю точку или вторая точка")
-            } else if (n == 0) {
-                sb.append("Привязка: выберите точку на «Карте», наведите на неё крестик → «Взять точку».\n")
-                sb.append("Или встаньте на точку → «Стою на точке». Долгий тап по карте = «я стою здесь».")
-            } else {
-                sb.append("1 точка есть. Нужна вторая точка или «Визир» на дальнюю точку.")
             }
-            selected?.let { sb.append("\nВыбрано: ").append(it.name) }
-            fs.hit?.let { sb.append("\nдо точки под крестиком: ").append(f2(fs.hitDist)).append(" м") }
         }
-        if (hint.isNotEmpty()) sb.append('\n').append(hint)
-        status.text = sb.toString()
-
-        // мини-карта: где я и куда смотрю
-        if (mapBox.visibility == View.VISIBLE) {
-            if (fs.tracking && fieldAl.aligned && !tableMode) {
-                val q = fieldAl.toPlan(fs.camPos)
-                map.device = floatArrayOf(q[0], q[2])
-                map.heading = fieldAl.dirToPlan(fs.camFwd[0], fs.camFwd[1])
-            } else {
-                map.device = null
-                map.heading = null
-            }
-            map.usedIds = fieldAl.snapshot().mapNotNull { o -> pkg?.controlPoints?.firstOrNull { it.name == o.name && hypot((it.local[0] - o.q[0]).toDouble(), (it.local[2] - o.q[2]).toDouble()) < 0.01 }?.id }.toSet()
-            map.invalidate()
-        }
-        bTake.text = if (tableMode) "Поставить" else "Взять точку"
     }
 
-    private fun toggleMap() {
-        val show = mapBox.visibility != View.VISIBLE
-        mapBox.visibility = if (show) View.VISIBLE else View.GONE
-        setActive(bMap, show)
+    private fun oneFinger(dx: Float, dy: Float) {
+        if (renderer.mode == Mode.VIEWER) {
+            renderer.orbit.yaw -= dx * 0.008f
+            renderer.orbit.pitch += dy * 0.006f
+        } else if (tablePlaced) {
+            tableRot -= dx * 0.01
+            applyTable()
+        }
     }
 
-    private fun toggleAdjust() {
-        if (!fieldAl.aligned) { toast("Сначала привяжите план хотя бы по одной точке"); return }
-        map.adjustMode = !map.adjustMode
-        adjustRow.visibility = if (map.adjustMode) View.VISIBLE else View.GONE
-        setActive(bAdjust, map.adjustMode)
-        if (map.adjustMode && mapBox.visibility != View.VISIBLE) toggleMap()
-        if (map.adjustMode) {
+    private fun twoFingers(scale: Float, dx: Float, dy: Float) {
+        if (renderer.mode == Mode.VIEWER) {
+            renderer.orbit.dist = (renderer.orbit.dist / scale).coerceIn(2f, 5000f)
+            renderer.orbit.pan(dx, dy, renderer.h)
+        } else if (tablePlaced) {
+            tableScale = (tableScale * scale).coerceIn(tableBaseScale * 0.05, tableBaseScale * 60)
             val fs = renderer.frameState
-            if (fs.tracking) { val q = fieldAl.toPlan(fs.camPos); map.centerOn(q[0], q[2]) }
+            if (fs.tracking) {
+                val k = (hypot((tableAt[0] - fs.camPos[0]).toDouble(), (tableAt[2] - fs.camPos[2]).toDouble()) * 0.0018).toFloat()
+                tableAt[0] += (fs.camRight[0] * dx - fs.camFwd[0] * dy) * k
+                tableAt[2] += (fs.camRight[1] * dx - fs.camFwd[1] * dy) * k
+            }
+            applyTable()
         }
     }
 
-    private fun toggleUnder() {
-        renderer.underground = !renderer.underground
-        setActive(bUnder, renderer.underground)
-        hint = if (renderer.underground) "Подземка: план полупрозрачный, видны сети и колодцы" else ""
+    // ─────────────────────────── макет ───────────────────────────
+
+    private fun placeTableAtAim() {
+        val fs = renderer.frameState
+        val aim = fs.aim ?: run { toast("Наведите крестик на стол или пол"); return }
+        val p = pkg ?: return
+        tableAt = aim.copyOf()
+        if (!tablePlaced) {
+            tableBaseScale = 0.8 / max(p.width, p.height)
+            tableScale = tableBaseScale
+        }
+        tablePlaced = true
+        renderer.showReticle = false
+        applyTable()
+    }
+
+    private fun applyTable() {
+        val p = pkg ?: return
+        if (!tablePlaced) return
+        val cx = ((p.minX + p.maxX) / 2 - p.originX).toFloat()
+        val cz = (-((p.minY + p.maxY) / 2 - p.originY)).toFloat()
+        tableAl.placeTable(tableAt, floatArrayOf(cx, p.groundAt(cx, cz), cz), tableScale, tableRot)
     }
 
     // ─────────────────────────── привязка ───────────────────────────
 
     override fun onPick(cp: ControlPoint) {
-        selected = cp
-        map.selected = cp
-        renderer.selectedPoint = cp.local
-        hint = ""
+        when (step) {
+            Step.SIGHT -> { target = cp; map.selected = cp; renderer.selectedPoint = cp.local }
+            else -> { selected = cp; customPoint = null; map.selected = cp; renderer.selectedPoint = cp.local }
+        }
+        updatePrimary()
     }
 
-    /** Долгий тап по карте: «я стою здесь». */
+    /** Долгое нажатие на карте: «я стою здесь» в любом месте. */
     override fun onStandHere(lx: Float, lz: Float, cp: ControlPoint?) {
+        if (renderer.mode != Mode.FIELD || (step != Step.STAND && step != Step.REFINE)) return
         val p = pkg ?: return
-        val q = if (cp != null) cp.local else floatArrayOf(lx, p.groundAt(lx, lz), lz)
-        if (cp != null) onPick(cp)
-        addStandPair(q, cp?.name ?: "точка на карте")
+        if (cp != null) { onPick(cp); return }
+        selected = null
+        customPoint = floatArrayOf(lx, p.groundAt(lx, lz), lz)
+        map.selected = ControlPoint(0, "место на карте", "custom", 0.0, 0.0, 0.0, customPoint!!,
+            p.localToPreview(lx, lz)[0], p.localToPreview(lx, lz)[1])
+        renderer.selectedPoint = customPoint
+        updatePrimary()
     }
 
     override fun onShiftDevice(dxLocal: Float, dzLocal: Float) {
@@ -377,108 +656,135 @@ class MainActivity : Activity(), MapView.Listener {
 
     private fun rotate(d: Double) {
         val fs = renderer.frameState
-        if (!fs.tracking) return
-        if (tableMode) {
-            tableRot += d
+        if (fs.tracking) fieldAl.rotateAbout(fs.camPos, d)
+    }
+
+    private fun updatePrimary() {
+        if (renderer.mode != Mode.FIELD) return
+        val fs = renderer.frameState
+        primary.isEnabled = when (step) {
+            Step.STAND, Step.REFINE -> (selected != null || customPoint != null) && fs.tracking
+            Step.SIGHT -> target != null && fs.tracking
+            Step.DONE -> true
+        }
+        primary.alpha = if (primary.isEnabled) 1f else 0.45f
+    }
+
+    private fun standHere() {
+        val fs = renderer.frameState
+        if (!fs.tracking) { toast("Подождите, пока камера найдёт поверхность"); return }
+        val q = selected?.local?.copyOf() ?: customPoint?.copyOf() ?: run { toast("Нажмите на карте точку, где стоите"); return }
+        val name = selected?.name ?: "место на карте"
+        val cam = fs.camPos
+        // высота земли: найденная плоскость, иначе «рост» 1,4 м
+        val p = floatArrayOf(cam[0], if (fs.groundKnown) fs.groundY else cam[1] - 1.4f, cam[2])
+        fieldAl.addPair(Aligner.Obs(name, q, p, "stand"))
+        if (step == Step.STAND) {
+            // сразу показываем модель, повернув по компасу; точнее — на шаге 2
+            if (compass.reliable) fieldAl.setCompass(compass.azimuth, fs.camFwd[0], fs.camFwd[1])
+            setStep(Step.SIGHT)
+            toast(if (compass.reliable) "Модель повёрнута по компасу — примерно. Теперь шаг 2." else "Теперь шаг 2: направление")
+        } else {
+            setStep(Step.DONE)
+            toast("Привязка уточнена по ${fieldAl.count()} точкам")
+        }
+    }
+
+    private fun sightNow() {
+        val fs = renderer.frameState
+        if (!fs.tracking) { toast("Нет трекинга"); return }
+        val t = target ?: run { toast("Нажмите на карте точку, на которую наводите"); return }
+        val st = fieldAl.snapshot().minByOrNull { hypot((it.p[0] - fs.camPos[0]).toDouble(), (it.p[2] - fs.camPos[2]).toDouble()) }
+            ?: run { setStep(Step.STAND); return }
+        val off = hypot((st.p[0] - fs.camPos[0]).toDouble(), (st.p[2] - fs.camPos[2]).toDouble())
+        if (off > 3.0) { toast(String.format(Locale.US, "Вы отошли от точки на %.1f м. Вернитесь на неё или начните заново", off)); return }
+        fieldAl.setSight(st.q, t.local, fs.camFwd[0], fs.camFwd[1])
+        setStep(Step.DONE)
+        toast("План привязан. Проверьте: оранжевая вешка должна стоять на выбранной точке")
+        renderer.selectedPoint = t.local
+    }
+
+    private fun toggleAdjust(b: Button) {
+        if (!fieldAl.aligned) return
+        map.adjustMode = !map.adjustMode
+        adjustRow.visibility = if (map.adjustMode) View.VISIBLE else View.GONE
+        setActive(b, map.adjustMode)
+        if (map.adjustMode) { setMapBig(true); centerMapOnMe() }
+    }
+
+    private fun centerMapOnMe() {
+        val fs = renderer.frameState
+        if (fs.tracking && fieldAl.aligned) { val q = fieldAl.toPlan(fs.camPos); map.centerOn(q[0], q[2]) }
+    }
+
+    private fun toggleUnder(b: Button) {
+        renderer.underground = !renderer.underground
+        setActive(b, renderer.underground)
+    }
+
+    // ─────────────────────────── статус ───────────────────────────
+
+    private val tick = object : Runnable {
+        override fun run() {
+            try { updateStatus() } catch (_: Exception) {}
+            ui.postDelayed(this, 250)
+        }
+    }
+
+    private fun f2(v: Double) = String.format(Locale.US, "%.2f", v)
+
+    private fun updateStatus() {
+        val m = renderer.mode
+        if (m == Mode.START || m == Mode.VIEWER) {
+            status.text = if (m == Mode.VIEWER) (pkg?.name ?: "") else ""
             return
         }
-        fieldAl.rotateAbout(fs.camPos, d)
-    }
-
-    private fun takePoint() {
         val fs = renderer.frameState
-        if (!fs.tracking) { toast("Нет трекинга"); return }
-        val hit = fs.hit ?: run { toast("Крестик не попал на поверхность — поводите телефоном"); return }
-        if (tableMode) { placeTable(hit); return }
-        val cp = selected ?: run { toast("Сначала выберите точку на карте"); if (mapBox.visibility != View.VISIBLE) toggleMap(); return }
-        fieldAl.addPair(Aligner.Obs(cp.name, cp.local.copyOf(), hit.copyOf(), "aim"))
-        afterPair(fs)
-    }
-
-    private fun standOnSelected() {
-        val cp = selected ?: run { toast("Выберите на карте точку, на которой стоите (или долгий тап по карте)"); if (mapBox.visibility != View.VISIBLE) toggleMap(); return }
-        addStandPair(cp.local.copyOf(), cp.name)
-    }
-
-    private fun addStandPair(q: FloatArray, name: String) {
-        if (tableMode) { toast("Выйдите из режима «Макет»"); return }
-        val fs = renderer.frameState
-        if (!fs.tracking) { toast("Нет трекинга"); return }
-        val cam = fs.camPos
-        // высота земли: точка под крестиком, если она рядом (смотрим под ноги), иначе рост ~1,35 м
-        val hit = fs.hit
-        val groundY = if (hit != null && hypot((hit[0] - cam[0]).toDouble(), (hit[2] - cam[2]).toDouble()) < 1.5) hit[1] else cam[1] - 1.35f
-        fieldAl.addPair(Aligner.Obs(name, q, floatArrayOf(cam[0], groundY, cam[2]), "stand"))
-        afterPair(fs)
-        toast("Стою: $name")
-    }
-
-    private fun afterPair(fs: FrameState) {
-        // первая точка: прикидываем направление по компасу, чтобы модель сразу появилась
-        if (fieldAl.count() == 1 && !fieldAl.hasBearing() && compass.reliable) {
-            fieldAl.setCompass(compass.azimuth, fs.camFwd[0], fs.camFwd[1])
-            hint = "Направление пока по компасу (грубо, ±10°)"
-        } else hint = ""
-        selected = null
-        map.selected = null
-        renderer.selectedPoint = null
-    }
-
-    private fun sight() {
-        if (tableMode) return
-        val fs = renderer.frameState
-        if (!fs.tracking) { toast("Нет трекинга"); return }
-        val target = selected ?: run { toast("Выберите на карте дальнюю точку и наведите на неё центр экрана"); if (mapBox.visibility != View.VISIBLE) toggleMap(); return }
-        // станция — ближайшая взятая точка, рядом с которой стоим
-        val st = fieldAl.snapshot().minByOrNull { hypot((it.p[0] - fs.camPos[0]).toDouble(), (it.p[2] - fs.camPos[2]).toDouble()) }
-        if (st == null || hypot((st.p[0] - fs.camPos[0]).toDouble(), (st.p[2] - fs.camPos[2]).toDouble()) > 2.5) {
-            toast("Визир: сначала встаньте на точку («Стою на точке»), потом наводите на дальнюю"); return
+        val sb = StringBuilder()
+        if (!fs.tracking) {
+            sb.append(fs.message)
+        } else if (m == Mode.TABLE) {
+            if (!tablePlaced) {
+                if (fs.aim != null && fs.aimOnPlane && fs.groundKnown) {
+                    placeTableAtAim()              // нашли стол — ставим сами
+                    toast("Макет поставлен. 1 палец — повернуть, 2 пальца — масштаб и сдвиг")
+                } else sb.append("Медленно поводите телефоном над столом или полом — модель встанет сама")
+            } else sb.append("1 палец — повернуть · 2 пальца — масштаб и сдвиг · «Поставить сюда» — в крестик")
+        } else {
+            if (fieldAl.aligned) {
+                sb.append("Привязка: ").append(fieldAl.source)
+                val res = fieldAl.residuals()
+                if (res.size >= 2) {
+                    sb.append(" · невязки ")
+                    res.forEach { sb.append(f2(it[0].toDouble())).append(' ') }
+                    sb.append("м")
+                }
+                val p = pkg
+                if (p != null) {
+                    val q = fieldAl.toPlan(fs.camPos)
+                    val x0 = (p.minX - p.originX); val x1 = (p.maxX - p.originX)
+                    val z0 = -(p.maxY - p.originY); val z1 = -(p.minY - p.originY)
+                    val dx = max(0.0, max(x0 - q[0], q[0] - x1)); val dz = max(0.0, max(z0 - q[2], q[2] - z1))
+                    val out = hypot(dx, dz)
+                    if (out > 3) sb.append("\n⚠ Вы вне участка: до его края ").append(out.toInt()).append(" м. Проверьте, та ли точка выбрана.")
+                }
+                val dev = fieldAl.toPlan(fs.camPos)
+                map.device = floatArrayOf(dev[0], dev[2])
+                map.heading = fieldAl.dirToPlan(fs.camFwd[0], fs.camFwd[1])
+            } else {
+                sb.append(if (fs.groundKnown) "Земля найдена ✓" else "Ищу землю — наведите камеру под ноги на пару секунд")
+                map.device = null; map.heading = null
+            }
+            map.invalidate()
         }
-        fieldAl.setSight(st.q, target.local, fs.camFwd[0], fs.camFwd[1])
-        hint = "Направление по визиру на «${target.name}»"
-        renderer.selectedPoint = target.local
-    }
-
-    private fun undo() {
-        if (tableMode) { table.reset(); return }
-        fieldAl.undo()
-        hint = ""
-    }
-
-    private fun confirmReset() {
-        AlertDialog.Builder(this)
-            .setMessage("Сбросить привязку?")
-            .setPositiveButton("Сбросить") { _, _ -> fieldAl.reset(); hint = "" }
-            .setNegativeButton("Отмена", null)
-            .show()
-    }
-
-    // ─────────────────────────── макет на столе ───────────────────────────
-
-    private fun toggleTable() {
-        tableMode = !tableMode
-        setActive(bTable, tableMode)
-        renderer.aligner = if (tableMode) table else fieldAl
-        if (tableMode) {
-            table.reset()
-            hint = "Макет: наведите крестик на стол → «Поставить». Повторное «Поставить» поворачивает на 15°"
-        } else hint = ""
-    }
-
-    private fun placeTable(at: FloatArray) {
-        val p = pkg ?: return
-        val cx = ((p.minX + p.maxX) / 2 - p.originX).toFloat()
-        val cz = (-((p.minY + p.maxY) / 2 - p.originY)).toFloat()
-        val center = floatArrayOf(cx, p.groundAt(cx, cz), cz)
-        val s = 0.8 / max(p.width, p.height)
-        tableRot += Math.toRadians(15.0) * if (table.aligned) 1 else 0
-        table.placeTable(at, center, s, tableRot)
+        status.text = sb.toString()
+        updatePrimary()
     }
 
     // ─────────────────────────── слои, инфо ───────────────────────────
 
     private fun layersDialog() {
-        val p = pkg ?: run { toast("Пакет не открыт"); return }
+        val p = pkg ?: return
         val items = ArrayList<String>()
         val ids = ArrayList<String>()
         items.add("Топоплан (подложка)"); ids.add("plan")
@@ -487,7 +793,7 @@ class MainActivity : Activity(), MapView.Listener {
             if (ids[i] == "plan") renderer.showPlan else renderer.layerVisible[ids[i]] ?: true
         }
         AlertDialog.Builder(this)
-            .setTitle("Слои")
+            .setTitle("Слои (подземные видны в режиме «Подземка»)")
             .setMultiChoiceItems(items.toTypedArray(), checked) { _, which, on ->
                 if (ids[which] == "plan") renderer.showPlan = on else renderer.layerVisible[ids[which]] = on
             }
@@ -499,19 +805,18 @@ class MainActivity : Activity(), MapView.Listener {
         val p = pkg
         val msg = StringBuilder()
         if (p != null) {
-            msg.append("Начало СК: X ").append(p.originX).append("  Y ").append(p.originY).append("  H ").append(p.originZ).append('\n')
-            msg.append("Опорных точек: ").append(p.controlPoints.size).append("\n\n").append(p.stats)
             val fs = renderer.frameState
             if (fs.tracking && fieldAl.aligned) {
                 val q = fieldAl.toPlan(fs.camPos)
                 val msk = p.mskOf(q[0], q[2])
-                msg.append("\nТелефон сейчас (по привязке):\nE ").append(String.format(Locale.US, "%.2f", msk[0]))
-                    .append("  N ").append(String.format(Locale.US, "%.2f", msk[1]))
+                msg.append("Телефон сейчас (по привязке):\nE ").append(f2(msk[0])).append("   N ").append(f2(msk[1])).append("\n\n")
             }
-        } else msg.append("Пакет не открыт")
-        msg.append("\n\nКомпас: ").append(if (compass.reliable) String.format(Locale.US, "%.0f°", compass.azimuth) else "нет данных")
-            .append(" (склонение ").append(String.format(Locale.US, "%.1f°", compass.declination)).append(")")
-        AlertDialog.Builder(this).setTitle("ТопоAR").setMessage(msg.toString()).setPositiveButton("OK", null).show()
+            msg.append("Привязка: ").append(fieldAl.source.ifEmpty { "нет" }).append('\n')
+            fieldAl.snapshot().forEachIndexed { i, o -> msg.append("  ").append(i + 1).append(". ").append(o.name).append('\n') }
+            msg.append("\n").append(p.stats)
+        }
+        msg.append("\nКомпас: ").append(if (compass.reliable) String.format(Locale.US, "%.0f°", compass.azimuth) else "нет данных")
+        AlertDialog.Builder(this).setTitle("Инфо").setMessage(msg.toString()).setPositiveButton("OK", null).show()
     }
 
     // ─────────────────────────── файлы ───────────────────────────
@@ -545,7 +850,7 @@ class MainActivity : Activity(), MapView.Listener {
     }
 
     private fun importUri(uri: Uri) {
-        status.text = "Копирую пакет…"
+        startPkg.text = "Копирую пакет…"
         thread {
             try {
                 contentResolver.openInputStream(uri)?.use { TopoPackage.copyToCache(it, cacheFile) }
@@ -558,21 +863,20 @@ class MainActivity : Activity(), MapView.Listener {
     }
 
     private fun loadPackage(f: File, label: String) {
-        status.text = "Загружаю $label…"
+        startPkg.text = "Загружаю $label…"
         thread {
             try {
                 val p = TopoPackage.load(f, renderer.maxTexture)
                 ui.post {
                     pkg = p
                     map.pkg = p
-                    fieldAl.reset(); table.reset()
-                    selected = null
-                    renderer.selectedPoint = null
+                    fieldAl.reset(); tableAl.reset()
                     renderer.setPackage(p)
-                    toast("Открыт: ${p.name}, слоёв ${p.layers.size}, опорных точек ${p.controlPoints.size}")
+                    updateStartPkg()
+                    if (renderer.mode != Mode.START) enterMode(Mode.START)
                 }
             } catch (e: Throwable) {
-                ui.post { toast("Пакет не читается: ${e.message}") }
+                ui.post { toast("Пакет не читается: ${e.message}"); updateStartPkg() }
             }
         }
     }
