@@ -35,6 +35,7 @@ import com.google.ar.core.Session
 import java.io.File
 import java.util.Locale
 import kotlin.concurrent.thread
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 
@@ -90,6 +91,13 @@ class MainActivity : Activity(), MapView.Listener {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         compass = Compass(this)
+        // память под чёткие плитки подложки: на слабых телефонах — 2048 px и меньше плиток
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        if (am.isLowRamDevice || am.largeMemoryClass < 384) {
+            renderer.fullTileMax = 2048; renderer.maxFullTiles = 6
+        } else {
+            renderer.fullTileMax = 4096; renderer.maxFullTiles = if (am.largeMemoryClass >= 768) 8 else 6
+        }
         renderer = ArRenderer { msg -> ui.post { toast(msg) } }
         buildUi()
         handleIntent(intent)
@@ -205,7 +213,7 @@ class MainActivity : Activity(), MapView.Listener {
         } else stopAr()
 
         renderer.mode = m
-        renderer.underground = false
+        setUnder(false)
         renderer.selectedPoint = null
         when (m) {
             Mode.START -> showStart()
@@ -239,13 +247,15 @@ class MainActivity : Activity(), MapView.Listener {
         mapBox.visibility = View.GONE
         crosshair.visibility = View.GONE
         renderer.showReticle = false
-        stepText.text = "Один палец — вращать. Два пальца — приблизить и сдвинуть."
+        stepText.text = "1 палец — вращать · 2 пальца — приблизить к точке и сдвинуть · двойной тап — подлететь"
         primary.visibility = View.GONE
         setActions(
-            act("Подземка") { toggleUnder(it) },
+            underBtn(),
+            act("Показать всё") { fitAll() },
+            pointsBtn(),
+            act("Сверху") { renderer.orbit.pitch = 1.55f; renderer.orbit.yaw = 0f },
+            act("Сбоку") { renderer.orbit.pitch = 0.12f },
             act("Слои") { layersDialog() },
-            act("Сверху") { renderer.orbit.pitch = 1.45f; renderer.orbit.yaw = 0f },
-            act("Сбросить вид") { pkg?.let { renderer.resetOrbit(it) } },
         )
     }
 
@@ -262,10 +272,11 @@ class MainActivity : Activity(), MapView.Listener {
         primary.text = "Поставить сюда"
         primary.setOnClickListener { placeTableAtAim() }
         setActions(
-            act("Подземка") { toggleUnder(it) },
-            act("Слои") { layersDialog() },
+            underBtn(),
             act("Крупнее") { tableScale *= 1.5; applyTable() },
             act("Мельче") { tableScale /= 1.5; applyTable() },
+            pointsBtn(),
+            act("Слои") { layersDialog() },
         )
     }
 
@@ -313,9 +324,10 @@ class MainActivity : Activity(), MapView.Listener {
             Step.DONE -> {
                 setMapBig(false)
                 stepText.text = "Готово — план на месте. Подвинуть вручную: «Подвинуть» и тащите карту."
-                primary.text = "Подземка"
+                primary.text = "Подземка: показать сети"
                 primary.setOnClickListener { toggleUnder(primary) }
                 setActions(
+                    pointsBtn(),
                     act("Слои") { layersDialog() },
                     act("Карта ↕") { setMapBig(!bigMap) },
                     act("Подвинуть") { toggleAdjust(it) },
@@ -397,7 +409,7 @@ class MainActivity : Activity(), MapView.Listener {
         glView = GLSurfaceView(this)
         glView.preserveEGLContextOnPause = true
         glView.setEGLContextClientVersion(3)
-        glView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+        glView.setEGLConfigChooser(8, 8, 8, 8, 24, 0)
         glView.setRenderer(renderer)
         glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         glView.setOnTouchListener { _, e -> onGlTouch(e); true }
@@ -519,7 +531,18 @@ class MainActivity : Activity(), MapView.Listener {
     private fun updateStartPkg() {
         val p = pkg
         startPkg.text = if (p == null) "Пакет не открыт. Скиньте на телефон файл .topoar и откройте его."
-        else "Открыт: ${p.name}\n${p.width.toInt()} × ${p.height.toInt()} м · слоёв ${p.layers.size} · опорных точек ${p.controlPoints.size}"
+        else {
+            val kind = if (p.kind == "photogrammetry") "3D-модель по фото" else "топоплан"
+            val nets = p.layers.count { it.underground }
+            val extra = buildList {
+                if (nets > 0) add("сетей: $nets")
+                if (p.tiles != null) add("подложка плитками: ${p.tiles.tiles.size}")
+                if (p.layers.any { it.texMesh != null }) add("модель с текстурой")
+                if (p.layers.any { it.points != null }) add("облако точек")
+            }
+            "Открыт $kind: ${p.name}\n${p.width.toInt()} × ${p.height.toInt()} м · слоёв ${p.layers.size} · точек привязки ${p.controlPoints.size}" +
+                if (extra.isNotEmpty()) "\n" + extra.joinToString(" · ") else ""
+        }
     }
 
     /** Крестик по центру экрана. */
@@ -538,6 +561,16 @@ class MainActivity : Activity(), MapView.Listener {
     // ─────────────────────────── жесты по 3D ───────────────────────────
 
     private var lx = 0f; private var ly = 0f; private var ld = 0f
+    private var downX = 0f; private var downY = 0f; private var downT = 0L
+    private var lastTapX = 0f; private var lastTapY = 0f; private var lastTapT = 0L
+
+    /** Двойной тап: плавно подлететь к точке в 2,5 раза. */
+    private fun animateZoom(px: Float, py: Float) {
+        val target = pickGround(px, py) ?: return
+        val steps = 14
+        val k = Math.pow(2.5, 1.0 / steps).toFloat()
+        for (i in 1..steps) ui.postDelayed({ renderer.orbit.zoomTo(target, k) }, (i * 16).toLong())
+    }
     private var lmx = 0f; private var lmy = 0f
 
     private fun baseline(e: MotionEvent) {
@@ -551,7 +584,20 @@ class MainActivity : Activity(), MapView.Listener {
         val m = renderer.mode
         if (m != Mode.VIEWER && m != Mode.TABLE) return
         when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> baseline(e)
+            MotionEvent.ACTION_DOWN -> {
+                baseline(e)
+                downX = e.x; downY = e.y; downT = System.currentTimeMillis()
+            }
+            MotionEvent.ACTION_UP -> {
+                val now = System.currentTimeMillis()
+                val tap = now - downT < 250 && hypot((e.x - downX).toDouble(), (e.y - downY).toDouble()) < dp(12)
+                if (tap && m == Mode.VIEWER) {
+                    if (now - lastTapT < 350 && hypot((e.x - lastTapX).toDouble(), (e.y - lastTapY).toDouble()) < dp(40)) {
+                        animateZoom(e.x, e.y); lastTapT = 0L
+                    } else { lastTapT = now; lastTapX = e.x; lastTapY = e.y }
+                }
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> baseline(e)
             MotionEvent.ACTION_POINTER_UP -> {
                 // остаётся один палец — новая опора по нему
                 val keep = if (e.actionIndex == 0) 1 else 0
@@ -562,7 +608,7 @@ class MainActivity : Activity(), MapView.Listener {
                     val mx = (e.getX(0) + e.getX(1)) / 2; val my = (e.getY(0) + e.getY(1)) / 2
                     val d = hypot((e.getX(1) - e.getX(0)).toDouble(), (e.getY(1) - e.getY(0)).toDouble()).toFloat()
                     val scale = if (ld > 10f) d / ld else 1f
-                    twoFingers(scale, mx - lmx, my - lmy)
+                    twoFingers(scale, mx - lmx, my - lmy, mx, my)
                     lmx = mx; lmy = my; ld = d
                 } else {
                     oneFinger(e.x - lx, e.y - ly)
@@ -582,9 +628,9 @@ class MainActivity : Activity(), MapView.Listener {
         }
     }
 
-    private fun twoFingers(scale: Float, dx: Float, dy: Float) {
+    private fun twoFingers(scale: Float, dx: Float, dy: Float, fx: Float, fy: Float) {
         if (renderer.mode == Mode.VIEWER) {
-            renderer.orbit.dist = (renderer.orbit.dist / scale).coerceIn(2f, 5000f)
+            if (abs(scale - 1f) > 0.002f) renderer.orbit.zoomTo(pickGround(fx, fy), scale)
             renderer.orbit.pan(dx, dy, renderer.h)
         } else if (tablePlaced) {
             tableScale = (tableScale * scale).coerceIn(tableBaseScale * 0.05, tableBaseScale * 60)
@@ -717,9 +763,74 @@ class MainActivity : Activity(), MapView.Listener {
         if (fs.tracking && fieldAl.aligned) { val q = fieldAl.toPlan(fs.camPos); map.centerOn(q[0], q[2]) }
     }
 
+    /** «Подземка» (рентген): включить сети и трассы, землю — полупрозрачной; выключить — как в scene.json. */
+    private fun setUnder(on: Boolean) {
+        renderer.underground = on
+        if (on) {
+            pkg?.layers?.forEach { l -> if (l.underground || l.id == "underground_traces") renderer.layerVisible[l.id] = true }
+        } else renderer.resetVisibility()
+    }
+
     private fun toggleUnder(b: Button) {
-        renderer.underground = !renderer.underground
+        setUnder(!renderer.underground)
+        if (b === primary) primary.text = if (renderer.underground) "Подземка: скрыть сети" else "Подземка: показать сети"
+        else setActive(b, renderer.underground)
+        val p = pkg
+        if (renderer.underground && p != null && p.layers.none { it.underground })
+            toast("В этом пакете нет подземных сетей")
+    }
+
+    private fun underBtn(): Button {
+        val b = act("Подземка") { toggleUnder(it) }
         setActive(b, renderer.underground)
+        return b
+    }
+
+    private fun pointsBtn(): Button {
+        val b = act("Точки") { renderer.showPoints = !renderer.showPoints; setActive(it, renderer.showPoints) }
+        setActive(b, renderer.showPoints)
+        return b
+    }
+
+    private fun fitAll() {
+        val p = pkg ?: return
+        renderer.orbit.fit(p.fitBox, renderer.w, renderer.h)
+    }
+
+    /** Точка рельефа под пикселем экрана (просмотр без камеры), иначе — плоскость на высоте фокуса. */
+    private fun pickGround(px: Float, py: Float): FloatArray? {
+        val p = pkg ?: return null
+        val o = renderer.orbit
+        val r = o.ray(px, py, renderer.w, renderer.h)
+        val maxT = o.dist * 6f + o.extent * 2f
+        var step = max(0.01f, o.dist / 150f)
+        var t = 0f
+        var prevAbove = true
+        var prevT = 0f
+        while (t < maxT) {
+            val x = r[0] + r[3] * t; val y = r[1] + r[4] * t; val z = r[2] + r[5] * t
+            val inside = x >= p.fitBox[0] - 50 && x <= p.fitBox[3] + 50 && z >= p.fitBox[2] - 50 && z <= p.fitBox[5] + 50
+            val above = !inside || y > p.groundAt(x, z)
+            if (!above && prevAbove && t > 0f) {
+                // уточнение делением пополам
+                var a = prevT; var b = t
+                repeat(16) {
+                    val m = (a + b) / 2
+                    val mx = r[0] + r[3] * m; val mz = r[2] + r[5] * m
+                    if (r[1] + r[4] * m > p.groundAt(mx, mz)) a = m else b = m
+                }
+                val m = (a + b) / 2
+                return floatArrayOf(r[0] + r[3] * m, r[1] + r[4] * m, r[2] + r[5] * m)
+            }
+            prevAbove = above; prevT = t
+            t += step
+            step *= 1.02f
+        }
+        if (abs(r[4]) > 1e-4f) {
+            val tt = (o.ty - r[1]) / r[4]
+            if (tt > 0) return floatArrayOf(r[0] + r[3] * tt, o.ty, r[2] + r[5] * tt)
+        }
+        return null
     }
 
     // ─────────────────────────── статус ───────────────────────────
@@ -736,7 +847,8 @@ class MainActivity : Activity(), MapView.Listener {
     private fun updateStatus() {
         val m = renderer.mode
         if (m == Mode.START || m == Mode.VIEWER) {
-            status.text = if (m == Mode.VIEWER) (pkg?.name ?: "") else ""
+            status.text = if (m == Mode.VIEWER) listOfNotNull(pkg?.name, renderer.tileInfo.ifEmpty { null },
+                if (renderer.underground) "подземка: сети видны сквозь землю" else null).joinToString(" · ") else ""
             return
         }
         val fs = renderer.frameState
@@ -787,13 +899,22 @@ class MainActivity : Activity(), MapView.Listener {
         val p = pkg ?: return
         val items = ArrayList<String>()
         val ids = ArrayList<String>()
-        items.add("Топоплан (подложка)"); ids.add("plan")
-        p.layers.forEach { items.add(it.title + if (it.underground) "  · подземка" else ""); ids.add(it.id) }
+        items.add(if (p.kind == "photogrammetry") "Ортофото на рельефе" else "Топоплан (подложка)"); ids.add("plan")
+        // сначала наземные, потом сети
+        p.layers.sortedBy { if (it.underground || it.id == "underground_traces") 1 else 0 }.forEach {
+            val tag = when {
+                it.underground -> "  · сеть"
+                it.texMesh != null -> "  · текстура"
+                it.points != null -> "  · точки"
+                else -> ""
+            }
+            items.add(it.title + tag); ids.add(it.id)
+        }
         val checked = BooleanArray(items.size) { i ->
-            if (ids[i] == "plan") renderer.showPlan else renderer.layerVisible[ids[i]] ?: true
+            if (ids[i] == "plan") renderer.showPlan else renderer.layerVisible[ids[i]] ?: false
         }
         AlertDialog.Builder(this)
-            .setTitle("Слои (подземные видны в режиме «Подземка»)")
+            .setTitle("Слои")
             .setMultiChoiceItems(items.toTypedArray(), checked) { _, which, on ->
                 if (ids[which] == "plan") renderer.showPlan = on else renderer.layerVisible[ids[which]] = on
             }
@@ -866,7 +987,7 @@ class MainActivity : Activity(), MapView.Listener {
         startPkg.text = "Загружаю $label…"
         thread {
             try {
-                val p = TopoPackage.load(f, renderer.maxTexture)
+                val p = TopoPackage.load(f, renderer.maxTexture) { what -> ui.post { startPkg.text = "Загружаю $label: $what…" } }
                 ui.post {
                     pkg = p
                     map.pkg = p

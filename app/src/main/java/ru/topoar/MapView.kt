@@ -172,7 +172,8 @@ class MapView(ctx: Context) : View(ctx) {
             if (s[0] < -r || s[1] < -r || s[0] > width + r || s[1] > height + r) continue
             pPt.color = when {
                 cp.id in usedIds -> Color.BLACK
-                cp.type == "corner" -> Color.rgb(221, 90, 18)
+                cp.type == "corner" -> Color.rgb(214, 40, 40)
+                cp.type == "point" -> Color.rgb(245, 200, 20)
                 cp.type == "manhole" -> Color.rgb(31, 99, 196)
                 else -> Color.rgb(107, 111, 120)
             }

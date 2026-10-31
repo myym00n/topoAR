@@ -64,6 +64,18 @@ object Gl {
         return if (v[0] > 0) v[0] else 2048
     }
 
+    /** Предел анизотропной фильтрации (0 — расширения нет). Задаётся в onSurfaceCreated. */
+    var maxAniso = 0f
+
+    fun detectAniso() {
+        val ext = GLES30.glGetString(GLES30.GL_EXTENSIONS) ?: ""
+        maxAniso = if (ext.contains("GL_EXT_texture_filter_anisotropic")) {
+            val v = FloatArray(1)
+            GLES30.glGetFloatv(0x84FF, v, 0)
+            v[0]
+        } else 0f
+    }
+
     fun uploadTexture(bmp: Bitmap): Int {
         val t = IntArray(1)
         GLES30.glGenTextures(1, t, 0)
@@ -74,6 +86,7 @@ object Gl {
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
         GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, bmp, 0)     // битмап предумножен на альфу
         GLES30.glGenerateMipmap(GLES30.GL_TEXTURE_2D)
+        if (maxAniso > 1f) GLES30.glTexParameterf(GLES30.GL_TEXTURE_2D, 0x84FE, minOf(8f, maxAniso))   // чёткость под острым углом
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
         check("uploadTexture")
         return t[0]
@@ -229,17 +242,27 @@ class GpuLayer(val data: LayerData) {
     }
 }
 
-/** Подложка: топоплан, натянутый на рельеф. */
-class PlanRenderer {
+/**
+ * Текстурированная сетка (TAP1): подложка-топоплан на рельефе или модель с фототекстурой.
+ * Подложка может быть разбита на плитки: каждая рисуется своим куском индексов,
+ * с полноразмерной текстурой (если подгружена) или с обзорной plan.png.
+ */
+class TexMeshRenderer {
     private var prog = 0
     private var uMvp = 0
     private var uTex = 0
     private var uAlpha = 0
     private var uPaper = 0
+    private var uClip = 0
+    private var uMap = 0
     private var vbo = 0
     private var ibo = 0
+    private var tileIbo = 0
     private var tex = 0
     private var count = 0
+    var tiles: TileSet? = null; private set
+    /** Полноразмерные текстуры плиток: индекс в tiles.tiles → id текстуры. */
+    val fullTex = HashMap<Int, Int>()
 
     fun init() {
         prog = Gl.program(
@@ -251,14 +274,17 @@ class PlanRenderer {
             void main() { gl_Position = uMvp * vec4(aPos, 1.0); vUv = aUv; }
             """.trimIndent(),
             """#version 300 es
-            precision mediump float;
+            precision highp float;
             uniform sampler2D uTex;
             uniform float uAlpha;
             uniform vec4 uPaper;      // предумноженный цвет «бумаги» под линиями (a = 0 — без бумаги)
+            uniform vec4 uClip;       // u0, t0, u1, t1 — область плитки (вне — discard)
+            uniform vec4 uMap;        // u0, t0, du, dt — как пересчитать uv в текстуру плитки
             in vec2 vUv;
             out vec4 oColor;
             void main() {
-                vec4 t = texture(uTex, vUv) * uAlpha;
+                if (vUv.x < uClip.x || vUv.y < uClip.y || (vUv.x >= uClip.z && uClip.z < 0.9999) || (vUv.y >= uClip.w && uClip.w < 0.9999)) discard;
+                vec4 t = texture(uTex, (vUv - uMap.xy) / uMap.zw) * uAlpha;
                 oColor = t + uPaper * (1.0 - t.a);
             }
             """.trimIndent())
@@ -266,44 +292,82 @@ class PlanRenderer {
         uTex = GLES30.glGetUniformLocation(prog, "uTex")
         uAlpha = GLES30.glGetUniformLocation(prog, "uAlpha")
         uPaper = GLES30.glGetUniformLocation(prog, "uPaper")
+        uClip = GLES30.glGetUniformLocation(prog, "uClip")
+        uMap = GLES30.glGetUniformLocation(prog, "uMap")
     }
 
-    fun upload(plan: PlanMesh, bmp: Bitmap) {
+    val ready get() = count > 0
+
+    fun upload(mesh: PlanMesh, bmp: Bitmap, tileSet: TileSet? = null) {
         release()
-        val b = IntArray(2)
-        GLES30.glGenBuffers(2, b, 0)
-        vbo = b[0]; ibo = b[1]
-        plan.vertices.position(0)
-        plan.indices.position(0)
+        val b = IntArray(3)
+        GLES30.glGenBuffers(3, b, 0)
+        vbo = b[0]; ibo = b[1]; tileIbo = b[2]
+        mesh.vertices.position(0)
+        mesh.indices.position(0)
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo)
-        GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, plan.vertexCount * 20, plan.vertices, GLES30.GL_STATIC_DRAW)
+        GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, mesh.vertexCount * 20, mesh.vertices, GLES30.GL_STATIC_DRAW)
         GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, ibo)
-        GLES30.glBufferData(GLES30.GL_ELEMENT_ARRAY_BUFFER, plan.indexCount * 4, plan.indices, GLES30.GL_STATIC_DRAW)
+        GLES30.glBufferData(GLES30.GL_ELEMENT_ARRAY_BUFFER, mesh.indexCount * 4, mesh.indices, GLES30.GL_STATIC_DRAW)
+        if (tileSet != null) {
+            tileSet.indices.position(0)
+            GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, tileIbo)
+            GLES30.glBufferData(GLES30.GL_ELEMENT_ARRAY_BUFFER, maxOf(1, tileSet.indexCount) * 4, tileSet.indices, GLES30.GL_STATIC_DRAW)
+        }
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
         GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, 0)
         tex = Gl.uploadTexture(bmp)
-        count = plan.indexCount
-        Gl.check("PlanRenderer.upload")
+        count = mesh.indexCount
+        tiles = tileSet
+        Gl.check("TexMeshRenderer.upload")
     }
 
-    /** [paperAlpha] > 0 — подложить под план светлую «землю» (для просмотра без камеры). */
+    fun setFullTile(i: Int, bmp: Bitmap) {
+        dropFullTile(i)
+        fullTex[i] = Gl.uploadTexture(bmp)
+    }
+
+    fun dropFullTile(i: Int) {
+        fullTex.remove(i)?.let { GLES30.glDeleteTextures(1, intArrayOf(it), 0) }
+    }
+
+    /** [paperAlpha] > 0 — подложить светлую «землю» (просмотр без камеры). */
     fun draw(mvp: FloatArray, alpha: Float, paperAlpha: Float = 0f) {
-        if (count == 0) return
+        if (count == 0 || alpha <= 0.001f && paperAlpha <= 0.001f) return
         GLES30.glUseProgram(prog)
         GLES30.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
         GLES30.glUniform1f(uAlpha, alpha)
         val pa = paperAlpha
         GLES30.glUniform4f(uPaper, 0.93f * pa, 0.92f * pa, 0.87f * pa, pa)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex)
         GLES30.glUniform1i(uTex, 0)
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo)
         GLES30.glEnableVertexAttribArray(0)
         GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 20, 0)
         GLES30.glEnableVertexAttribArray(1)
         GLES30.glVertexAttribPointer(1, 2, GLES30.GL_FLOAT, false, 20, 12)
-        GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, ibo)
-        GLES30.glDrawElements(GLES30.GL_TRIANGLES, count, GLES30.GL_UNSIGNED_INT, 0)
+        val ts = tiles
+        if (ts == null) {
+            GLES30.glUniform4f(uClip, -1f, -1f, 2f, 2f)
+            GLES30.glUniform4f(uMap, 0f, 0f, 1f, 1f)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex)
+            GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, ibo)
+            GLES30.glDrawElements(GLES30.GL_TRIANGLES, count, GLES30.GL_UNSIGNED_INT, 0)
+        } else {
+            GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, tileIbo)
+            ts.tiles.forEachIndexed { i, t ->
+                GLES30.glUniform4f(uClip, t.u0, t.t0, t.u1, t.t1)
+                val full = fullTex[i]
+                if (full != null) {
+                    GLES30.glUniform4f(uMap, t.u0, t.t0, t.u1 - t.u0, t.t1 - t.t0)
+                    GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, full)
+                } else {
+                    GLES30.glUniform4f(uMap, 0f, 0f, 1f, 1f)
+                    GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex)
+                }
+                GLES30.glDrawElements(GLES30.GL_TRIANGLES, t.indexCount, GLES30.GL_UNSIGNED_INT, t.indexOffset * 4)
+            }
+        }
         GLES30.glDisableVertexAttribArray(0)
         GLES30.glDisableVertexAttribArray(1)
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
@@ -311,10 +375,82 @@ class PlanRenderer {
     }
 
     fun release() {
-        if (vbo != 0) GLES30.glDeleteBuffers(2, intArrayOf(vbo, ibo), 0)
+        if (vbo != 0) GLES30.glDeleteBuffers(3, intArrayOf(vbo, ibo, tileIbo), 0)
         if (tex != 0) GLES30.glDeleteTextures(1, intArrayOf(tex), 0)
-        vbo = 0; ibo = 0; tex = 0; count = 0
+        fullTex.values.forEach { GLES30.glDeleteTextures(1, intArrayOf(it), 0) }
+        fullTex.clear()
+        vbo = 0; ibo = 0; tileIbo = 0; tex = 0; count = 0; tiles = null
     }
+}
+
+/** Облако точек: круглые точки постоянного размера в метрах. */
+class PointRenderer {
+    private var prog = 0
+    private var uMvp = 0
+    private var uPx = 0
+    private var uAlpha = 0
+
+    fun init() {
+        prog = Gl.program(
+            """#version 300 es
+            layout(location = 0) in vec3 aPos;
+            layout(location = 1) in vec4 aCol;
+            uniform mat4 uMvp;
+            uniform float uPx;        // размер точки (м) × пикселей на метр на расстоянии 1
+            out vec4 vCol;
+            void main() {
+                gl_Position = uMvp * vec4(aPos, 1.0);
+                gl_PointSize = clamp(uPx / max(gl_Position.w, 0.001), 1.0, 48.0);
+                vCol = aCol;
+            }
+            """.trimIndent(),
+            """#version 300 es
+            precision mediump float;
+            uniform float uAlpha;
+            in vec4 vCol;
+            out vec4 oColor;
+            void main() {
+                vec2 d = gl_PointCoord - vec2(0.5);
+                if (dot(d, d) > 0.25) discard;
+                float a = vCol.a * uAlpha;
+                oColor = vec4(vCol.rgb * a, a);
+            }
+            """.trimIndent())
+        uMvp = GLES30.glGetUniformLocation(prog, "uMvp")
+        uPx = GLES30.glGetUniformLocation(prog, "uPx")
+        uAlpha = GLES30.glGetUniformLocation(prog, "uAlpha")
+    }
+
+    class Gpu(val vbo: Int, val count: Int, val size: Float)
+
+    fun upload(pc: PointCloud): Gpu {
+        val b = IntArray(1)
+        GLES30.glGenBuffers(1, b, 0)
+        pc.data.position(0)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, b[0])
+        GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, pc.count * 16, pc.data, GLES30.GL_STATIC_DRAW)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+        return Gpu(b[0], pc.count, pc.pointSize)
+    }
+
+    /** [pxPerMeterAt1m] = высота экрана / (2·tan(fov/2)); [scale] — масштаб модели (макет). */
+    fun draw(g: Gpu, mvp: FloatArray, pxPerMeterAt1m: Float, scale: Float, alpha: Float) {
+        GLES30.glUseProgram(prog)
+        GLES30.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
+        GLES30.glUniform1f(uPx, g.size * scale * pxPerMeterAt1m)
+        GLES30.glUniform1f(uAlpha, alpha)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, g.vbo)
+        GLES30.glEnableVertexAttribArray(0)
+        GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 16, 0)
+        GLES30.glEnableVertexAttribArray(1)
+        GLES30.glVertexAttribPointer(1, 4, GLES30.GL_UNSIGNED_BYTE, true, 16, 12)
+        GLES30.glDrawArrays(GLES30.GL_POINTS, 0, g.count)
+        GLES30.glDisableVertexAttribArray(0)
+        GLES30.glDisableVertexAttribArray(1)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+    }
+
+    fun release(g: Gpu) = GLES30.glDeleteBuffers(1, intArrayOf(g.vbo), 0)
 }
 
 /** Простые фигуры для маркеров: кольцо прицела и вешка. */
