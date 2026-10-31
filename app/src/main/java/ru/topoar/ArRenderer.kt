@@ -177,6 +177,12 @@ class ArRenderer(private val onError: (String) -> Unit) : GLSurfaceView.Renderer
     private val identity = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
 
     private var smoothAim: FloatArray? = null
+    private val culler = Culler()
+    private val invModel = FloatArray(16)
+    private val tmp4 = FloatArray(4)
+    private var lastFrameNs = 0L
+    private var fpsAvg = 30f
+    @Volatile var perfInfo = ""; private set
 
     // ── подгрузка плиток подложки ──
     private val decoder = Executors.newSingleThreadExecutor()
@@ -269,7 +275,7 @@ class ArRenderer(private val onError: (String) -> Unit) : GLSurfaceView.Renderer
         Matrix.multiplyMM(viewProj, 0, proj, 0, view, 0)
         pxPerMeter = h * proj[5] / 2f
         val ga = if (underground) 0.6f else 1f
-        drawScene(identity, ga, paper = ga, modelScale = 1f)
+        drawScene(identity, ga, paper = ga, modelScale = 1f, camWorld = orbit.eye())
         if (showPoints) drawControlPins(identity, orbit.dist / 120f)
         selectedPoint?.let { q -> shapes.drawPin(meshShader, q[0], q[1], q[2], max(0.05f, orbit.dist / 60f), viewProj, ORANGE) }
     }
@@ -354,7 +360,7 @@ class ArRenderer(private val onError: (String) -> Unit) : GLSurfaceView.Renderer
             al.modelMatrix(model)
             // поверх камеры на участке землю в «Подземке» не рисуем: видны трассы и трубы
             val groundA = if (underground) (if (mode == Mode.FIELD) 0f else 0.6f) else planAlpha
-            drawScene(model, groundA, paper = 0f, modelScale = al.scale.toFloat())
+            drawScene(model, groundA, paper = 0f, modelScale = al.scale.toFloat(), camWorld = cam)
             if (showPoints) drawControlPins(model, (if (mode == Mode.TABLE) 0.02f else 0.5f))
             selectedPoint?.let { q ->
                 val p = al.toAr(q)
@@ -369,18 +375,25 @@ class ArRenderer(private val onError: (String) -> Unit) : GLSurfaceView.Renderer
      * Порядок: непрозрачное (запись глубины) → полупрозрачное без записи глубины.
      * [groundAlpha] — прозрачность «земли» (подложка, model, pg_model): 1 обычно, 0.6 в «Подземке», 0 поверх камеры.
      */
-    private fun drawScene(modelM: FloatArray, groundAlpha: Float, paper: Float, modelScale: Float) {
+    private fun drawScene(modelM: FloatArray, groundAlpha: Float, paper: Float, modelScale: Float, camWorld: FloatArray) {
         val p = loaded ?: return
+        // отсечение: камера в координатах модели; мелкие детали дальше 300 м — только в натуральном масштабе
+        Matrix.invertM(invModel, 0, modelM, 0)
+        Matrix.multiplyMV(tmp4, 0, invModel, 0, floatArrayOf(camWorld[0], camWorld[1], camWorld[2], 1f), 0)
+        culler.cam[0] = tmp4[0]; culler.cam[1] = tmp4[1]; culler.cam[2] = tmp4[2]
+        culler.farDetail = if (modelScale > 0.5f) 300f else 0f
         GLES30.glEnable(GLES30.GL_DEPTH_TEST)
         GLES30.glDepthMask(true)
         GLES30.glEnable(GLES30.GL_BLEND)
         GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE_MINUS_SRC_ALPHA)   // цвета предумножены
         Matrix.multiplyMM(mvp, 0, viewProj, 0, modelM, 0)
+        System.arraycopy(mvp, 0, culler.mvp, 0, 16)
         val groundOpaque = groundAlpha >= 0.999f
+        var tris = 0
 
         // 1. непрозрачное
         meshShader.begin(modelM, mvp)
-        for (g in gpuLayers) if (vis(g.data) && (!g.data.isGround || groundOpaque)) g.draw(meshShader, false, 1f)
+        for (g in gpuLayers) if (vis(g.data) && (!g.data.isGround || groundOpaque)) { g.draw(meshShader, false, 1f, culler); tris += g.drawn }
         for (l in p.layers) {
             if (!vis(l)) continue
             texLayers[l.id]?.let { if (!l.isGround || groundOpaque) it.draw(mvp, 1f) }
@@ -390,7 +403,7 @@ class ArRenderer(private val onError: (String) -> Unit) : GLSurfaceView.Renderer
         // 2. полупрозрачное
         GLES30.glDepthMask(false)
         meshShader.begin(modelM, mvp)
-        for (g in gpuLayers) if (vis(g.data) && (!g.data.isGround || groundOpaque)) g.draw(meshShader, true, 1f)
+        for (g in gpuLayers) if (vis(g.data) && (!g.data.isGround || groundOpaque)) { g.draw(meshShader, true, 1f, culler); tris += g.drawn }
         if (showPlan && planR.ready) {
             val a = if (groundOpaque) planAlpha else groundAlpha
             planR.draw(mvp, a, paper * if (groundOpaque) 1f else groundAlpha)
@@ -399,7 +412,7 @@ class ArRenderer(private val onError: (String) -> Unit) : GLSurfaceView.Renderer
         if (!groundOpaque && groundAlpha > 0.001f) {
             meshShader.begin(modelM, mvp)
             for (g in gpuLayers) if (vis(g.data) && g.data.isGround) {
-                g.draw(meshShader, false, groundAlpha); g.draw(meshShader, true, groundAlpha)
+                g.draw(meshShader, false, groundAlpha, culler); g.draw(meshShader, true, groundAlpha, culler)
             }
             for (l in p.layers) {
                 if (!vis(l) || !l.isGround) continue
@@ -408,6 +421,11 @@ class ArRenderer(private val onError: (String) -> Unit) : GLSurfaceView.Renderer
             }
         }
         GLES30.glDepthMask(true)
+        // FPS для строки состояния
+        val now = System.nanoTime()
+        if (lastFrameNs > 0) fpsAvg = fpsAvg * 0.95f + 0.05f * (1e9f / max(1L, now - lastFrameNs))
+        lastFrameNs = now
+        perfInfo = "%.0f к/с · %d тыс. треуг.".format(fpsAvg, tris / 1000)
     }
 
     private fun vis(l: LayerData): Boolean = layerVisible[l.id] ?: l.defaultVisible
@@ -418,7 +436,7 @@ class ArRenderer(private val onError: (String) -> Unit) : GLSurfaceView.Renderer
         val tmp = FloatArray(4)
         for (c in p.controlPoints) {
             val col = when (c.type) {
-                "corner" -> RED; "point" -> YELLOW; "manhole" -> BLUE; else -> GREY
+                "geodetic" -> MAROON; "corner" -> RED; "manhole" -> BLUE; "pole" -> GREY; "elev" -> GREEN; else -> YELLOW
             }
             Matrix.multiplyMV(tmp, 0, modelM, 0, floatArrayOf(c.local[0], c.local[1], c.local[2], 1f), 0)
             shapes.drawPin(meshShader, tmp[0], tmp[1], tmp[2], size, viewProj, col)
@@ -523,5 +541,7 @@ class ArRenderer(private val onError: (String) -> Unit) : GLSurfaceView.Renderer
         val RED = floatArrayOf(0.86f, 0.16f, 0.16f, 1f)
         val YELLOW = floatArrayOf(0.98f, 0.80f, 0.10f, 1f)
         val GREY = floatArrayOf(0.55f, 0.57f, 0.6f, 1f)
+        val MAROON = floatArrayOf(0.55f, 0.05f, 0.18f, 1f)
+        val GREEN = floatArrayOf(0.17f, 0.6f, 0.25f, 1f)
     }
 }

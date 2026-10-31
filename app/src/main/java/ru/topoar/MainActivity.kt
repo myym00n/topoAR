@@ -300,7 +300,7 @@ class MainActivity : Activity(), MapView.Listener {
             Step.STAND, Step.REFINE -> {
                 setMapBig(true)
                 stepText.text = (if (s == Step.STAND) "Шаг 1 из 2 · Где вы стоите?\n" else "Уточнение · Встаньте на другую точку\n") +
-                    "Встаньте точно на заметную точку (угол здания, люк, столб) и нажмите её на карте.\n" +
+                    "Встаньте точно на заметную точку и нажмите её на карте. Надёжнее всего — геодезический пункт (бордовый треугольник), потом угол здания, люк, столб.\n" +
                     "Нужной точки нет — долгое нажатие на карте отметит любое место."
                 primary.text = "Я стою здесь"
                 primary.setOnClickListener { standHere() }
@@ -847,7 +847,7 @@ class MainActivity : Activity(), MapView.Listener {
     private fun updateStatus() {
         val m = renderer.mode
         if (m == Mode.START || m == Mode.VIEWER) {
-            status.text = if (m == Mode.VIEWER) listOfNotNull(pkg?.name, renderer.tileInfo.ifEmpty { null },
+            status.text = if (m == Mode.VIEWER) listOfNotNull(pkg?.name, renderer.perfInfo.ifEmpty { null }, renderer.tileInfo.ifEmpty { null },
                 if (renderer.underground) "подземка: сети видны сквозь землю" else null).joinToString(" · ") else ""
             return
         }
@@ -889,6 +889,8 @@ class MainActivity : Activity(), MapView.Listener {
             }
             map.invalidate()
         }
+        if (fs.tracking && renderer.perfInfo.isNotEmpty() && (m == Mode.TABLE && tablePlaced || m == Mode.FIELD && fieldAl.aligned))
+            sb.append("\n").append(renderer.perfInfo).append(if (renderer.tileInfo.isNotEmpty()) " · " + renderer.tileInfo else "")
         status.text = sb.toString()
         updatePrimary()
     }

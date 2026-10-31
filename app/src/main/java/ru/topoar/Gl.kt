@@ -199,18 +199,57 @@ class MeshShader {
     fun color(c: FloatArray, alphaMul: Float = 1f) = GLES30.glUniform4f(uColor, c[0], c[1], c[2], c[3] * alphaMul)
 }
 
-/** Слой на GPU: по VBO на каждую часть одного цвета. */
+/**
+ * Отсечение: клетки вне кадра не рисуются; у мелких деталей (опоры, знаки) — и дальние,
+ * дальше [farDetail] м от камеры (только в натуральном масштабе).
+ */
+class Culler {
+    val mvp = FloatArray(16)
+    val cam = FloatArray(3)          // камера в координатах модели
+    var farDetail = 0f               // 0 — без отсечения по дальности
+    private val v = FloatArray(4)
+    private val p = FloatArray(4)
+
+    fun visible(box: FloatArray, detail: Boolean): Boolean {
+        if (detail && farDetail > 0f) {
+            val dx = maxOf(box[0] - cam[0], 0f, cam[0] - box[3])
+            val dy = maxOf(box[1] - cam[1], 0f, cam[1] - box[4])
+            val dz = maxOf(box[2] - cam[2], 0f, cam[2] - box[5])
+            if (dx * dx + dy * dy + dz * dz > farDetail * farDetail) return false
+        }
+        var l = 0; var r = 0; var bo = 0; var t = 0; var be = 0
+        for (k in 0 until 8) {
+            p[0] = if (k and 1 == 0) box[0] else box[3]
+            p[1] = if (k and 2 == 0) box[1] else box[4]
+            p[2] = if (k and 4 == 0) box[2] else box[5]
+            p[3] = 1f
+            android.opengl.Matrix.multiplyMV(v, 0, mvp, 0, p, 0)
+            val w = v[3]
+            if (w <= 0f) { be++; continue }
+            if (v[0] < -w) l++; if (v[0] > w) r++; if (v[1] < -w) bo++; if (v[1] > w) t++
+        }
+        if (be == 8) return false
+        val front = 8 - be
+        return !(front > 0 && be == 0 && (l == 8 || r == 8 || bo == 8 || t == 8))
+    }
+}
+
+/** Слой на GPU: по VBO на каждую клетку каждой части. */
 class GpuLayer(val data: LayerData) {
-    private val vbos = IntArray(data.parts.size)
+    private val vbos = IntArray(data.parts.sumOf { it.chunks.size })
     private var uploaded = false
+    /** Мелкие детали — отсекаются по дальности. */
+    private val detail = data.id == "poles" || data.id == "structures" || data.id == "geodesy" || data.id == "power_lines"
+    var drawn = 0; private set
 
     fun upload() {
-        if (uploaded || data.parts.isEmpty()) return
+        if (uploaded || vbos.isEmpty()) return
         GLES30.glGenBuffers(vbos.size, vbos, 0)
-        data.parts.forEachIndexed { i, p ->
-            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbos[i])
-            p.data.position(0)
-            GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, p.vertexCount * 24, p.data, GLES30.GL_STATIC_DRAW)
+        var i = 0
+        for (p in data.parts) for (c in p.chunks) {
+            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbos[i++])
+            c.data.position(0)
+            GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, c.vertexCount * 24, c.data, GLES30.GL_STATIC_DRAW)
         }
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
         uploaded = true
@@ -218,18 +257,25 @@ class GpuLayer(val data: LayerData) {
     }
 
     /** [translucent]: рисовать только полупрозрачные (true) или только непрозрачные (false) части. */
-    fun draw(sh: MeshShader, translucent: Boolean, alphaMul: Float) {
+    fun draw(sh: MeshShader, translucent: Boolean, alphaMul: Float, cull: Culler? = null) {
         if (!uploaded) return
-        data.parts.forEachIndexed { i, p ->
+        var i = 0
+        drawn = 0
+        GLES30.glEnableVertexAttribArray(0)
+        GLES30.glEnableVertexAttribArray(1)
+        for (p in data.parts) {
             val tr = p.color[3] * alphaMul < 0.999f
-            if (tr != translucent) return@forEachIndexed
+            if (tr != translucent) { i += p.chunks.size; continue }
             sh.color(p.color, alphaMul)
-            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbos[i])
-            GLES30.glEnableVertexAttribArray(0)
-            GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 24, 0)
-            GLES30.glEnableVertexAttribArray(1)
-            GLES30.glVertexAttribPointer(1, 3, GLES30.GL_FLOAT, false, 24, 12)
-            GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, p.vertexCount)
+            for (c in p.chunks) {
+                val vbo = vbos[i++]
+                if (cull != null && !cull.visible(c.box, detail)) continue
+                GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo)
+                GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 24, 0)
+                GLES30.glVertexAttribPointer(1, 3, GLES30.GL_FLOAT, false, 24, 12)
+                GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, c.vertexCount)
+                drawn += c.vertexCount / 3
+            }
         }
         GLES30.glDisableVertexAttribArray(0)
         GLES30.glDisableVertexAttribArray(1)

@@ -23,8 +23,13 @@ class ControlPoint(
     val px: Float, val py: Float                    // пиксели на превью плана
 )
 
-/** Часть слоя одного цвета: вершины (позиция + нормаль). */
-class MeshPart(val color: FloatArray, val vertexCount: Int, val data: FloatBuffer)
+/** Кусок части слоя в одной клетке ~64 м: вершины (позиция + нормаль) и рамка (minx,miny,minz,maxx,maxy,maxz). */
+class MeshChunk(val vertexCount: Int, val data: FloatBuffer, val box: FloatArray)
+
+/** Часть слоя одного цвета, разрезанная на клетки — для отсечения невидимого и дальнего. */
+class MeshPart(val color: FloatArray, val chunks: List<MeshChunk>) {
+    val vertexCount get() = chunks.sumOf { it.vertexCount }
+}
 
 /** Облако точек: n записей по 16 байт (x,y,z float32 + r,g,b,a uint8). */
 class PointCloud(val count: Int, val data: ByteBuffer, val pointSize: Float)
@@ -250,15 +255,45 @@ class TopoPackage(
                 val color = floatArrayOf(bb.float, bb.float, bb.float, bb.float)
                 val nv = bb.int
                 val floats = nv * 6
-                val fb = ByteBuffer.allocateDirect(floats * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+                val arr = FloatArray(floats)
                 val slice = bb.slice().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
                 slice.limit(floats)
-                fb.put(slice)
-                fb.position(0)
+                slice.get(arr)
                 bb.position(bb.position() + floats * 4)
-                parts.add(MeshPart(color, nv, fb))
+                parts.add(MeshPart(color, splitChunks(arr, nv)))
             }
             return parts
+        }
+
+        /** Режет треугольники по клеткам [cell] м (по центру треугольника). Мелкие части — одним куском. */
+        fun splitChunks(arr: FloatArray, nv: Int, cell: Float = 64f): List<MeshChunk> {
+            val tris = nv / 3
+            fun chunkOf(list: IntArray?, count: Int): MeshChunk {
+                val fb = ByteBuffer.allocateDirect(count * 3 * 24).order(ByteOrder.nativeOrder()).asFloatBuffer()
+                val box = floatArrayOf(Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE)
+                for (k in 0 until count) {
+                    val t = list?.get(k) ?: k
+                    val o = t * 18
+                    fb.put(arr, o, 18)
+                    for (v in 0 until 3) for (a in 0 until 3) {
+                        val c = arr[o + v * 6 + a]
+                        if (c < box[a]) box[a] = c
+                        if (c > box[a + 3]) box[a + 3] = c
+                    }
+                }
+                fb.position(0)
+                return MeshChunk(count * 3, fb, box)
+            }
+            if (nv < 6000) return listOf(chunkOf(null, tris))
+            val cells = HashMap<Long, IntArrayList>()
+            for (t in 0 until tris) {
+                val o = t * 18
+                val cx = (arr[o] + arr[o + 6] + arr[o + 12]) / 3f
+                val cz = (arr[o + 2] + arr[o + 8] + arr[o + 14]) / 3f
+                val key = (Math.floorDiv(cx.toInt(), cell.toInt()).toLong() shl 32) or (Math.floorDiv(cz.toInt(), cell.toInt()).toLong() and 0xffffffffL)
+                cells.getOrPut(key) { IntArrayList() }.add(t)
+            }
+            return cells.values.map { chunkOf(it.data, it.size) }
         }
 
         /** TAP1 — и подложка (plan.mesh), и текстурированные модели (*.tap). */
@@ -358,8 +393,8 @@ class TopoPackage(
             plan?.let { p -> val st = max(1, p.vertexCount / 20000); var i = 0
                 while (i < p.vertexCount) { add(p.vertices.get(i * 5), p.vertices.get(i * 5 + 1), p.vertices.get(i * 5 + 2)); i += st } }
             for (l in layers) {
-                for (part in l.parts) { val st = max(1, part.vertexCount / 4000); var i = 0
-                    while (i < part.vertexCount) { add(part.data.get(i * 6), part.data.get(i * 6 + 1), part.data.get(i * 6 + 2)); i += st } }
+                for (part in l.parts) for (ch in part.chunks) { val st = max(1, ch.vertexCount / 1000); var i = 0
+                    while (i < ch.vertexCount) { add(ch.data.get(i * 6), ch.data.get(i * 6 + 1), ch.data.get(i * 6 + 2)); i += st } }
                 l.texMesh?.let { p -> val st = max(1, p.vertexCount / 8000); var i = 0
                     while (i < p.vertexCount) { add(p.vertices.get(i * 5), p.vertices.get(i * 5 + 1), p.vertices.get(i * 5 + 2)); i += st } }
                 l.points?.let { pc -> val st = max(1, pc.count / 8000); var i = 0

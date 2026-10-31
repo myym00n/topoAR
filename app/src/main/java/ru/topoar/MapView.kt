@@ -172,13 +172,24 @@ class MapView(ctx: Context) : View(ctx) {
             if (s[0] < -r || s[1] < -r || s[0] > width + r || s[1] > height + r) continue
             pPt.color = when {
                 cp.id in usedIds -> Color.BLACK
+                cp.type == "geodetic" -> Color.rgb(140, 12, 46)
                 cp.type == "corner" -> Color.rgb(214, 40, 40)
-                cp.type == "point" -> Color.rgb(245, 200, 20)
                 cp.type == "manhole" -> Color.rgb(31, 99, 196)
-                else -> Color.rgb(107, 111, 120)
+                cp.type == "pole" -> Color.rgb(107, 111, 120)
+                cp.type == "elev" -> Color.rgb(43, 153, 64)
+                else -> Color.rgb(245, 200, 20)
             }
-            c.drawCircle(s[0], s[1], r * 0.8f, pPt)
-            c.drawCircle(s[0], s[1], r * 0.8f, pStroke)
+            if (cp.type == "geodetic") {
+                // геодезический пункт — треугольник: по нему привязка самая надёжная
+                val rr = r * 1.4f
+                path.reset()
+                path.moveTo(s[0], s[1] - rr); path.lineTo(s[0] + rr * 0.9f, s[1] + rr * 0.6f); path.lineTo(s[0] - rr * 0.9f, s[1] + rr * 0.6f); path.close()
+                c.drawPath(path, pPt)
+                c.drawPath(path, pStroke)
+            } else {
+                c.drawCircle(s[0], s[1], r * 0.8f, pPt)
+                c.drawCircle(s[0], s[1], r * 0.8f, pStroke)
+            }
         }
         selected?.let { cp ->
             val s = toScreen(cp.px, cp.py)
