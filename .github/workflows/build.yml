@@ -29,6 +29,22 @@ jobs:
           chmod +x gradlew
           ./gradlew --no-daemon assembleDebug
 
+      - name: Автотест — приложение открывается
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Текст ошибок автотеста
+        if: failure()
+        run: |
+          for f in app/build/test-results/testDebugUnitTest/*.xml; do
+            python3 - "$f" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          for tc in ET.parse(sys.argv[1]).getroot().iter('testcase'):
+              for fl in list(tc.findall('failure')) + list(tc.findall('error')):
+                  txt = (fl.get('message') or '') + ' | ' + (fl.text or '')[:1500]
+                  print('::error title=' + tc.get('name') + '::' + txt.replace('\n', '%0A'))
+          PY
+          done
+
       - name: Переименовать APK
         run: cp app/build/outputs/apk/debug/app-debug.apk TopoAR.apk
 

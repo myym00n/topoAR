@@ -90,7 +90,9 @@ class MainActivity : Activity(), MapView.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        installCrashLog()
         compass = Compass(this)
+        renderer = ArRenderer { msg -> ui.post { toast(msg) } }
         // память под чёткие плитки подложки: на слабых телефонах — 2048 px и меньше плиток
         val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
         if (am.isLowRamDevice || am.largeMemoryClass < 384) {
@@ -98,10 +100,11 @@ class MainActivity : Activity(), MapView.Listener {
         } else {
             renderer.fullTileMax = 4096; renderer.maxFullTiles = if (am.largeMemoryClass >= 768) 8 else 6
         }
-        renderer = ArRenderer { msg -> ui.post { toast(msg) } }
         buildUi()
+        val crashed = showLastCrash()
         handleIntent(intent)
-        if (pkg == null && cacheFile.exists()) loadPackage(cacheFile, "последний пакет")
+        // после сбоя последний пакет сам не открываем — вдруг дело в нём
+        if (pkg == null && cacheFile.exists() && !crashed) loadPackage(cacheFile, "последний пакет")
         showStart()
         ui.post(tick)
     }
@@ -153,6 +156,54 @@ class MainActivity : Activity(), MapView.Listener {
             pendingMode = null
             toast("Без доступа к камере AR не работает. 3D-просмотр доступен.")
         }
+    }
+
+    // ─────────────────────────── сбои ───────────────────────────
+
+    private val crashFile by lazy { File(filesDir, "last_crash.txt") }
+
+    /** Любое падение записывается в файл — при следующем запуске показываем текст, чтобы его можно было прислать. */
+    private fun installCrashLog() {
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val sw = java.io.StringWriter()
+                e.printStackTrace(java.io.PrintWriter(sw))
+                crashFile.writeText("ТопоAR ${versionName()} · поток ${t.name}\n$sw")
+            } catch (_: Throwable) {}
+            prev?.uncaughtException(t, e)
+        }
+    }
+
+    private fun versionName(): String = try {
+        @Suppress("DEPRECATION")
+        packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+    } catch (_: Throwable) { "" }
+
+    private fun showLastCrash(): Boolean {
+        if (!crashFile.exists()) return false
+        val text = try { crashFile.readText() } catch (_: Throwable) { "" }
+        crashFile.delete()
+        if (text.isBlank()) return false
+        val tv = TextView(this)
+        tv.text = text.take(6000)
+        tv.textSize = 11f
+        tv.setTextIsSelectable(true)
+        tv.setPadding(dp(16), dp(8), dp(16), dp(8))
+        val sv = ScrollView(this)
+        sv.addView(tv)
+        AlertDialog.Builder(this)
+            .setTitle("Прошлый запуск завершился ошибкой")
+            .setMessage("Последний пакет не открыт автоматически. Скопируйте текст ниже и пришлите разработчику.")
+            .setView(sv)
+            .setPositiveButton("Копировать") { _, _ ->
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("ТопоAR", text))
+                toast("Текст ошибки скопирован")
+            }
+            .setNegativeButton("Закрыть", null)
+            .show()
+        return true
     }
 
     // ─────────────────────────── ARCore ───────────────────────────
@@ -409,7 +460,7 @@ class MainActivity : Activity(), MapView.Listener {
         glView = GLSurfaceView(this)
         glView.preserveEGLContextOnPause = true
         glView.setEGLContextClientVersion(3)
-        glView.setEGLConfigChooser(8, 8, 8, 8, 24, 0)
+        glView.setEGLConfigChooser(SafeConfigChooser())
         glView.setRenderer(renderer)
         glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         glView.setOnTouchListener { _, e -> onGlTouch(e); true }
@@ -542,6 +593,25 @@ class MainActivity : Activity(), MapView.Listener {
             }
             "Открыт $kind: ${p.name}\n${p.width.toInt()} × ${p.height.toInt()} м · слоёв ${p.layers.size} · точек привязки ${p.controlPoints.size}" +
                 if (extra.isNotEmpty()) "\n" + extra.joinToString(" · ") else ""
+        }
+    }
+
+    /** Буфер глубины 24 бит, если есть, иначе 16 — чтобы не упасть на телефонах без нужной конфигурации. */
+    private class SafeConfigChooser : GLSurfaceView.EGLConfigChooser {
+        override fun chooseConfig(egl: javax.microedition.khronos.egl.EGL10, display: javax.microedition.khronos.egl.EGLDisplay): javax.microedition.khronos.egl.EGLConfig {
+            val E = javax.microedition.khronos.egl.EGL10.EGL_NONE
+            for (depth in intArrayOf(24, 16)) {
+                val attrs = intArrayOf(
+                    javax.microedition.khronos.egl.EGL10.EGL_RED_SIZE, 8, javax.microedition.khronos.egl.EGL10.EGL_GREEN_SIZE, 8,
+                    javax.microedition.khronos.egl.EGL10.EGL_BLUE_SIZE, 8, javax.microedition.khronos.egl.EGL10.EGL_ALPHA_SIZE, 8,
+                    javax.microedition.khronos.egl.EGL10.EGL_DEPTH_SIZE, depth,
+                    javax.microedition.khronos.egl.EGL10.EGL_RENDERABLE_TYPE, 0x40,   // EGL_OPENGL_ES3_BIT_KHR
+                    E)
+                val num = IntArray(1)
+                val cfgs = arrayOfNulls<javax.microedition.khronos.egl.EGLConfig>(1)
+                if (egl.eglChooseConfig(display, attrs, cfgs, 1, num) && num[0] > 0 && cfgs[0] != null) return cfgs[0]!!
+            }
+            throw IllegalArgumentException("Нет подходящей конфигурации OpenGL ES 3")
         }
     }
 
